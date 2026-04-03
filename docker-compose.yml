@@ -1,0 +1,30 @@
+services:
+  db:
+    image: postgres:latest
+    container_name: aerostream-db
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password123
+      POSTGRES_DB: aerostream
+    ports:
+      - "5432:5432"
+    volumes:               # ADD THIS
+      - pgdata:/var/lib/postgresql/data  # ADD THIS
+
+  # The Ingestion API
+  ingestion-api:
+    container_name: aerostream-api
+    build:
+      context: .
+      dockerfile: src/AeroStream.Ingestion/Dockerfile
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ConnectionStrings__DefaultConnection=Host=db;Database=aerostream;Username=admin;Password=password123
+    ports:
+      - "5233:8080" # Maps local 5233 to container 8080
+    depends_on:
+      - db # Ensures the database starts before the API
+
+# ADD THIS AT THE VERY BOTTOM OF THE FILE
+volumes:
+  pgdata:
