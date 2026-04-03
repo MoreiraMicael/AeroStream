@@ -23,14 +23,29 @@ interface Telemetry {
 }
 
 function App() {
-  // 1. THE BUFFER: We store data here to prevent React from re-rendering 100 times a second.
+  // 1. THE BUFFER
   const dronesRef = useRef<Record<string, Telemetry>>({});
   const pathsRef = useRef<Record<string, [number, number][]>>({});
 
-  // 2. THE UI STATE: This is what the user actually sees on screen.
+  // 2. THE UI STATE
   const [drones, setDrones] = useState<Record<string, Telemetry>>({});
   const [paths, setPaths] = useState<Record<string, [number, number][]>>({});
   const [status, setStatus] = useState("DISCONNECTED");
+
+  // 3. THE C2 COMMAND 
+  // It MUST live right here: inside App(), but outside useEffect().
+  const issueRTL = async (deviceId: string) => {
+    try {
+      await fetch(`http://localhost:5233/command/${deviceId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ command: 'RTL' })
+      });
+      console.log(`Commanded ${deviceId} to Return to Launch.`);
+    } catch (err) {
+      console.error("C2 Link Failed", err);
+    }
+  };
 
   useEffect(() => {
     const connection = new HubConnectionBuilder()
@@ -42,14 +57,12 @@ function App() {
       .then(() => {
         setStatus("LINK_OK");
         connection.on("ReceiveTelemetry", (data: Telemetry) => {
-          // Instantly buffer incoming data (Zero UI cost)
           dronesRef.current[data.deviceId] = data;
 
           if (!pathsRef.current[data.deviceId]) {
             pathsRef.current[data.deviceId] = [];
           }
           
-          // Add to path, but limit to 50 points per drone to prevent memory leaks
           pathsRef.current[data.deviceId].push([data.latitude, data.longitude]);
           if (pathsRef.current[data.deviceId].length > 50) {
              pathsRef.current[data.deviceId].shift();
@@ -58,11 +71,11 @@ function App() {
       })
       .catch(() => setStatus("LINK_LOST"));
 
-    // 3. THE RENDER LOOP: Update the UI at a safe 10 Frames Per Second
+    // 4. THE RENDER LOOP
     const renderInterval = setInterval(() => {
         setDrones({ ...dronesRef.current });
         setPaths({ ...pathsRef.current });
-    }, 100); // 100ms = 10 FPS
+    }, 100); 
 
     return () => { 
         connection.stop(); 
@@ -88,23 +101,26 @@ function App() {
         {Object.values(drones).length === 0 && <span style={{ color: '#94a3b8' }}>AWAITING_SWARM...</span>}
         
         {Object.values(drones).map(drone => (
-          <div key={drone.deviceId} style={{ fontSize: '0.8rem', borderBottom: '1px solid #f1f5f9', paddingBottom: '10px', marginBottom: '10px' }}>
-            ID: <strong style={{ color: '#3b82f6' }}>{drone.deviceId.substring(0,6)}</strong><br/>
-            ALT: {drone.altitude.toFixed(1)}m | SPD: {drone.speed.toFixed(0)}km/h
+          <div key={drone.deviceId} style={{ fontSize: '0.8rem', borderBottom: '1px solid #f1f5f9', paddingBottom: '10px', marginBottom: '10px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <div>
+              ID: <strong style={{ color: '#3b82f6' }}>{drone.deviceId.substring(0,6)}</strong><br/>
+              ALT: {drone.altitude.toFixed(1)}m | SPD: {drone.speed.toFixed(0)}km/h
+            </div>
+            <button 
+              onClick={() => issueRTL(drone.deviceId)}
+              style={{ background: '#dc2626', color: 'white', border: 'none', padding: '4px 8px', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold', fontSize: '0.7rem' }}>
+              RTL
+            </button>
           </div>
         ))}
       </aside>
 
-      {/* The Map (Auto-Center removed to stop camera thrashing) */}
-      <MapContainer center={[39.36, -9.14]} zoom={14} zoomControl={false} style={{ height: "100%", width: "100%" }}>
-        <TileLayer url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png" />
+<MapContainer center={[39.586514504614584, -9.021444943435336]} zoom={14} zoomControl={false} style={{ height: "100%", width: "100%" }}>        <TileLayer url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png" />
         
-        {/* Draw Trails */}
         {Object.entries(paths).map(([id, path]) => (
             <Polyline key={id} positions={path} pathOptions={{ color: '#3b82f6', weight: 3, opacity: 0.4 }} />
         ))}
 
-        {/* Draw Drones */}
         {Object.entries(drones).map(([id, data]) => (
             <Marker key={id} position={[data.latitude, data.longitude]} icon={TacticalIcon}>
                 <Popup>DRONE_ID: {id}</Popup>
