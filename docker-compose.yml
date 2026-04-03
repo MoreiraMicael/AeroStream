@@ -8,23 +8,31 @@ services:
       POSTGRES_DB: aerostream
     ports:
       - "5432:5432"
-    volumes:               # ADD THIS
-      - pgdata:/var/lib/postgresql/data  # ADD THIS
+    volumes:
+      - pgdata:/var/lib/postgresql/data
 
-  # The Ingestion API
   ingestion-api:
-    container_name: aerostream-api
-    build:
+    build: 
       context: .
-      dockerfile: src/AeroStream.Ingestion/Dockerfile
-    environment:
-      - ASPNETCORE_ENVIRONMENT=Development
-      - ConnectionStrings__DefaultConnection=Host=db;Database=aerostream;Username=admin;Password=password123
+      dockerfile: Dockerfile
+    container_name: aerostream-api
     ports:
-      - "5233:8080" # Maps local 5233 to container 8080
+      - "5233:8080"
     depends_on:
-      - db # Ensures the database starts before the API
+      - db
+    environment:
+      - ConnectionStrings__DefaultConnection=Host=db;Database=aerostream;Username=admin;Password=password123
 
-# ADD THIS AT THE VERY BOTTOM OF THE FILE
+  # --- NEW: The Frontend UI ---
+  dashboard:
+    build:
+      context: ./src/AeroStream.Dashboard
+      dockerfile: Dockerfile
+    container_name: aerostream-dashboard
+    ports:
+      - "5173:80" # Maps local 5173 to Nginx's internal 80
+    depends_on:
+      - ingestion-api
+
 volumes:
   pgdata:
