@@ -38,3 +38,6 @@ jobs:
           
           docker build -t $IMAGE_ID:latest -f src/AeroStream.Ingestion/Dockerfile .
           docker push $IMAGE_ID:latest
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
