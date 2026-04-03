@@ -1,32 +1,40 @@
-name: AeroStream CI
+name: AeroStream CI/CD
 
 on:
   push:
     branches: [ main ]
-  pull_request:
-    branches: [ main ]
+
+# Give GitHub permission to write to its own Container Registry
+permissions:
+  packages: write
+  contents: read
 
 jobs:
-  build:
-    # We use Linux because that is where modern .NET actually runs in production
+  build-and-test:
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Test
+        run: dotnet test
 
-    - name: Setup .NET 10
-      uses: actions/setup-dotnet@v4
-      with:
-        dotnet-version: '10.0.x'
+  deploy:
+    needs: build-and-test # Only deploy if tests pass
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Log in to GitHub Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
-    - name: Restore dependencies
-      run: dotnet restore
-
-    - name: Build
-      run: dotnet build --no-restore --configuration Release
-
-    - name: Test
-      run: dotnet test --no-build --configuration Release --verbosity normal
-
-    - name: Build Docker Image
-      run: docker build -t aerostream-ingestion:latest -f src/AeroStream.Ingestion/Dockerfile .
+      - name: Build and Push Docker Image
+        run: |
+          # Convert username to lowercase for Docker naming conventions
+          IMAGE_ID=ghcr.io/${{ github.repository_owner }}/aerostream-ingestion
+          IMAGE_ID=$(echo $IMAGE_ID | tr '[A-Z]' '[a-z]')
+          
+          docker build -t $IMAGE_ID:latest -f src/AeroStream.Ingestion/Dockerfile .
+          docker push $IMAGE_ID:latest
