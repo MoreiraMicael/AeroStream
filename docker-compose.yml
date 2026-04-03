@@ -1,15 +1,16 @@
 services:
   db:
-    image: postgres:latest
-    container_name: aerostream-db
-    environment:
-      POSTGRES_USER: admin
-      POSTGRES_PASSWORD: password123
-      POSTGRES_DB: aerostream
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
+      image: postgres:latest
+      container_name: aerostream-db
+      environment:
+        POSTGRES_USER: admin
+        POSTGRES_PASSWORD: password123
+        POSTGRES_DB: aerostream
+        PGDATA: /var/lib/postgresql/data/pgdata # MANDATORY FOR POSTGRES 18+
+      ports:
+        - "5432:5432"
+      volumes:
+        - pgdata:/var/lib/postgresql/data
 
   ingestion-api:
     build: 
