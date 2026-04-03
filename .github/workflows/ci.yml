@@ -27,3 +27,6 @@ jobs:
 
     - name: Test
       run: dotnet test --no-build --configuration Release --verbosity normal
+
+    - name: Build Docker Image
+      run: docker build -t aerostream-ingestion:latest -f src/AeroStream.Ingestion/Dockerfile .
