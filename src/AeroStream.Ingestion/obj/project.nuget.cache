@@ -1,0 +1,11 @@
+{
+  "version": 2,
+  "dgSpecHash": "KGr9J9exY3M=",
+  "success": true,
+  "projectFilePath": "C:\\Users\\Moreira\\AeroStream\\src\\AeroStream.Ingestion\\AeroStream.Ingestion.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\Moreira\\.nuget\\packages\\microsoft.aspnetcore.openapi\\10.0.0-preview.3.25172.1\\microsoft.aspnetcore.openapi.10.0.0-preview.3.25172.1.nupkg.sha512",
+    "C:\\Users\\Moreira\\.nuget\\packages\\microsoft.openapi\\2.0.0-preview.11\\microsoft.openapi.2.0.0-preview.11.nupkg.sha512"
+  ],
+  "logs": []
+}

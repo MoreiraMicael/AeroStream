@@ -1,0 +1,17 @@
+@hostname = 127.0.0.1
+@port = 5233
+
+POST http://{{hostname}}:{{port}}/telemetry
+Content-Type: application/json
+
+{
+    "DeviceId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+    "Latitude": 39.3611,
+    "Longitude": -9.1411,
+    "Altitude": 150.0,
+    "Speed": 45.5,
+    "Pitch": 1.0,
+    "Roll": 0.0,
+    "Yaw": 180.0,
+    "Timestamp": "2026-04-03T12:00:00Z"
+}
