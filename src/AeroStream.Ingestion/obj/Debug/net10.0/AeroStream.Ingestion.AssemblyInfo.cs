@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("AeroStream.Ingestion")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+bd28b2c469994b0f85b7f398e28790becd57ec89")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+78145014dede5a1063c6961deb08cbd49f447f67")]
 [assembly: System.Reflection.AssemblyProductAttribute("AeroStream.Ingestion")]
 [assembly: System.Reflection.AssemblyTitleAttribute("AeroStream.Ingestion")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

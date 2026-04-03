@@ -18,6 +18,7 @@ builder.Services.AddSerilog();
 builder.Services.AddOpenApi();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddHealthChecks(); // Standard for production monitoring
+builder.Services.AddSignalR();
 
 // 3. Register the Telemetry Pipeline
 builder.Services.AddSingleton(Channel.CreateBounded<TelemetryRecord>(1000));
@@ -32,6 +33,7 @@ if (app.Environment.IsDevelopment())
     app.MapScalarApiReference(); // Now this will work
 }
 
+app.MapHub<TelemetryHub>("/telemetryHub");
 app.MapHealthChecks("/health"); // Essential for Docker/Kubernetes
 
 // 5. The Ingestion Endpoint
