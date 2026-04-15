@@ -1,16 +1,24 @@
 import { useEffect, useState, useRef } from 'react';
 import { HubConnectionBuilder } from '@microsoft/signalr';
-import { MapContainer, TileLayer, Marker, Popup, Polyline } from 'react-leaflet';
+import { MapContainer, TileLayer, Marker, Popup, Polyline, useMapEvents } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
 
-// Tactical Icon Fix
+// Tactical Icons
 const TacticalIcon = L.icon({
     iconUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-icon.png',
     shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-shadow.png',
     iconSize: [25, 41],
     iconAnchor: [12, 41],
     popupAnchor: [1, -34]
+});
+
+// A small red dot for drawing waypoints
+const WaypointIcon = L.divIcon({
+    className: 'custom-waypoint',
+    html: '<div style="background-color: #ef4444; width: 12px; height: 12px; border-radius: 50%; border: 2px solid white; box-shadow: 0 0 4px rgba(0,0,0,0.5);"></div>',
+    iconSize: [16, 16],
+    iconAnchor: [8, 8]
 });
 
 interface Telemetry {
@@ -22,18 +30,32 @@ interface Telemetry {
   timestamp: string;
 }
 
+// NEW: Component to handle map clicks for drawing
+function MapClickHandler({ isDrawing, onMapClick }: { isDrawing: boolean, onMapClick: (latlng: [number, number]) => void }) {
+    useMapEvents({
+        click(e) {
+            if (isDrawing) {
+                onMapClick([e.latlng.lat, e.latlng.lng]);
+            }
+        }
+    });
+    return null; // This component doesn't render any DOM elements itself
+}
+
+
 function App() {
-  // 1. THE BUFFER
   const dronesRef = useRef<Record<string, Telemetry>>({});
   const pathsRef = useRef<Record<string, [number, number][]>>({});
 
-  // 2. THE UI STATE
   const [drones, setDrones] = useState<Record<string, Telemetry>>({});
   const [paths, setPaths] = useState<Record<string, [number, number][]>>({});
   const [status, setStatus] = useState("DISCONNECTED");
 
-  // 3. THE C2 COMMAND 
-  // It MUST live right here: inside App(), but outside useEffect().
+  // NEW: State for the dynamic route planner
+  const [isDrawMode, setIsDrawMode] = useState(false);
+  const [newRoute, setNewRoute] = useState<[number, number][]>([]);
+
+  // Existing RTL Command
   const issueRTL = async (deviceId: string) => {
     try {
       await fetch(`http://localhost:5233/command/${deviceId}`, {
@@ -45,6 +67,35 @@ function App() {
     } catch (err) {
       console.error("C2 Link Failed", err);
     }
+  };
+
+  // NEW: Deploy the drawn route to the entire swarm
+  const deploySwarmRoute = async () => {
+      if (newRoute.length === 0) return;
+
+      // Grab all active drone IDs from our ref
+      const activeIds = Object.keys(dronesRef.current);
+      
+      // Format the payload to match our new C# API model
+      const payload = {
+          deviceIds: activeIds,
+          route: newRoute.map(coord => ({ lat: coord[0], lng: coord[1] }))
+      };
+
+      try {
+          await fetch(`http://localhost:5233/command/swarm/route`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload)
+          });
+          console.log(`Deployed new route of ${newRoute.length} waypoints to ${activeIds.length} drones.`);
+          
+          // Reset UI
+          setIsDrawMode(false);
+          setNewRoute([]);
+      } catch (err) {
+          console.error("Route Deployment Failed", err);
+      }
   };
 
   useEffect(() => {
@@ -71,7 +122,6 @@ function App() {
       })
       .catch(() => setStatus("LINK_LOST"));
 
-    // 4. THE RENDER LOOP
     const renderInterval = setInterval(() => {
         setDrones({ ...dronesRef.current });
         setPaths({ ...pathsRef.current });
@@ -86,10 +136,32 @@ function App() {
   return (
     <div style={{ height: "100vh", width: "100vw", background: '#f1f5f9', color: '#0f172a', fontFamily: 'monospace' }}>
       
-      <header style={{ position: 'absolute', top: 0, width: '100%', zIndex: 1000, background: '#ffffff', borderBottom: '2px solid #3b82f6', padding: '12px 20px', display: 'flex', justifyContent: 'space-between', boxShadow: '0 2px 4px rgba(0,0,0,0.1)' }}>
+      <header style={{ position: 'absolute', top: 0, width: '100%', zIndex: 1000, background: '#ffffff', borderBottom: '2px solid #3b82f6', padding: '12px 20px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', boxShadow: '0 2px 4px rgba(0,0,0,0.1)' }}>
         <div style={{ fontWeight: 'bold' }}>
           <span style={{ color: '#3b82f6' }}>AEROSTREAM</span> // SWARM_COMMAND
         </div>
+
+        {/* NEW: Tactical Mission Planner Toolbar */}
+        <div style={{ display: 'flex', gap: '10px' }}>
+            {isDrawMode ? (
+                <>
+                    <button onClick={() => setNewRoute([])} style={{ background: '#64748b', color: 'white', border: 'none', padding: '6px 12px', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' }}>
+                        Clear Route
+                    </button>
+                    <button onClick={() => setIsDrawMode(false)} style={{ background: '#f87171', color: 'white', border: 'none', padding: '6px 12px', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' }}>
+                        Cancel
+                    </button>
+                    <button onClick={deploySwarmRoute} style={{ background: '#16a34a', color: 'white', border: 'none', padding: '6px 12px', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' }}>
+                        Deploy Swarm Route ({newRoute.length} WPs)
+                    </button>
+                </>
+            ) : (
+                <button onClick={() => setIsDrawMode(true)} style={{ background: '#3b82f6', color: 'white', border: 'none', padding: '6px 12px', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' }}>
+                    + Draw Patrol Route
+                </button>
+            )}
+        </div>
+
         <div style={{ fontWeight: 'bold', color: status === "LINK_OK" ? "#16a34a" : "#dc2626" }}>
           SIGNAL: {status} | DRONES: {Object.keys(drones).length}
         </div>
@@ -115,12 +187,26 @@ function App() {
         ))}
       </aside>
 
-<MapContainer center={[39.586514504614584, -9.021444943435336]} zoom={14} zoomControl={false} style={{ height: "100%", width: "100%" }}>        <TileLayer url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png" />
+      <MapContainer center={[39.586514, -9.021444]} zoom={14} zoomControl={false} style={{ height: "100%", width: "100%", cursor: isDrawMode ? 'crosshair' : 'grab' }}>
+        <TileLayer url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png" />
         
+        {/* NEW: Map Click Listener */}
+        <MapClickHandler isDrawing={isDrawMode} onMapClick={(coord) => setNewRoute([...newRoute, coord])} />
+
+        {/* NEW: Draw the planned route preview */}
+        {newRoute.length > 0 && (
+            <Polyline positions={newRoute} pathOptions={{ color: '#ef4444', weight: 4, dashArray: '10, 10' }} />
+        )}
+        {newRoute.map((coord, idx) => (
+            <Marker key={`wp-${idx}`} position={coord} icon={WaypointIcon} />
+        ))}
+
+        {/* Existing: Draw Drone Trails */}
         {Object.entries(paths).map(([id, path]) => (
             <Polyline key={id} positions={path} pathOptions={{ color: '#3b82f6', weight: 3, opacity: 0.4 }} />
         ))}
 
+        {/* Existing: Draw Drones */}
         {Object.entries(drones).map(([id, data]) => (
             <Marker key={id} position={[data.latitude, data.longitude]} icon={TacticalIcon}>
                 <Popup>DRONE_ID: {id}</Popup>

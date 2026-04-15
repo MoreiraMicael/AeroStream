@@ -32,6 +32,3 @@ npm run dev
 
 # Run from the root directory
 node simulate.js
-
-# Run from the root directory
-node simulate.js

@@ -26,37 +26,30 @@ builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddHealthChecks();
 builder.Services.AddSignalR();
 
-// Database
 var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
 builder.Services.AddDbContextFactory<TelemetryDbContext>(options =>
     options.UseNpgsql(connectionString));
 
-// CORS - Unified into a single, secure SignalR-compatible policy
 builder.Services.AddCors(options =>
 {
     options.AddDefaultPolicy(policy =>
     {
-        policy.WithOrigins("http://localhost:5173") // Your React app
+        policy.WithOrigins("http://localhost:5173", "http://localhost:5174") 
               .AllowAnyHeader()
               .AllowAnyMethod()
-              .AllowCredentials(); // Required for SignalR
+              .AllowCredentials(); 
     });
 });
 
-// Telemetry Pipeline & C2 State
 builder.Services.AddSingleton(Channel.CreateBounded<TelemetryRecord>(1000));
 builder.Services.AddHostedService<TelemetryProcessor>();
 
-// NEW: Register the Command Buffer into DI so any class/endpoint can access it
-builder.Services.AddSingleton<ConcurrentDictionary<string, string>>();
+// UPGRADE: The dictionary now holds a complex C2Payload object, not just a string
+builder.Services.AddSingleton<ConcurrentDictionary<string, C2Payload>>();
 
-
-// ==========================================
-// 3. HTTP PIPELINE
-// ==========================================
 var app = builder.Build();
 
-app.UseCors(); // Must remain before MapHub
+app.UseCors();
 
 if (app.Environment.IsDevelopment())
 {
@@ -67,38 +60,48 @@ if (app.Environment.IsDevelopment())
 app.MapHealthChecks("/health");
 app.MapHub<TelemetryHub>("/telemetryHub");
 
-
 // ==========================================
 // 4. API ENDPOINTS
 // ==========================================
 
-// The C2 Endpoint: Queues commands from the React Dashboard
-app.MapPost("/command/{deviceId}", (string deviceId, CommandRequest req, ConcurrentDictionary<string, string> commandQueue, ILogger<Program> logger) => 
+// Existing Endpoint: Individual Drone Commands (e.g., RTL)
+app.MapPost("/command/{deviceId}", (string deviceId, CommandRequest req, ConcurrentDictionary<string, C2Payload> commandQueue, ILogger<Program> logger) => 
 {
-    commandQueue[deviceId] = req.Command;
+    commandQueue[deviceId] = new C2Payload(req.Command);
     logger.LogInformation("[C2] Command '{Command}' queued for Drone {DeviceId}", req.Command, deviceId);
     return Results.Ok();
 });
 
-// The Telemetry Endpoint: Ingests data and piggybacks pending C2 commands
-app.MapPost("/telemetry", (TelemetryRecord record, Channel<TelemetryRecord> channel, ConcurrentDictionary<string, string> commandQueue, ILogger<Program> logger) =>
+// NEW Endpoint: Global Swarm Route Update
+app.MapPost("/command/swarm/route", (SwarmRouteRequest req, ConcurrentDictionary<string, C2Payload> commandQueue, ILogger<Program> logger) => 
 {
-    // 1. Try to push telemetry to the background worker (Synchronous, non-blocking)
+    // Loop through the provided drone IDs and assign the new route to each one
+    foreach(var id in req.DeviceIds) 
+    {
+        commandQueue[id] = new C2Payload("UPDATE_ROUTE", req.Route);
+    }
+    logger.LogInformation("[C2] UPDATE_ROUTE queued for {Count} drones", req.DeviceIds.Length);
+    return Results.Ok();
+});
+
+// The Telemetry Endpoint
+app.MapPost("/telemetry", (TelemetryRecord record, Channel<TelemetryRecord> channel, ConcurrentDictionary<string, C2Payload> commandQueue, ILogger<Program> logger) =>
+{
     if (!channel.Writer.TryWrite(record))
     {
         logger.LogWarning("Ingestion queue full. Dropping packet for {DeviceId}", record.DeviceId);
         return Results.StatusCode(503);
     }
     
-// 2. Check if the commander issued an order for this specific drone
-    // Fix: Convert the Guid DeviceId to a string to match the dictionary key
-    if (commandQueue.TryRemove(record.DeviceId.ToString(), out var c2Command)) 
+    // UPGRADE: We now extract the C2Payload object and return it directly
+    if (commandQueue.TryRemove(record.DeviceId.ToString(), out var payload)) 
     {
-        logger.LogInformation("Piggybacking '{Command}' onto ACK for {DeviceId}", c2Command, record.DeviceId);
-        return Results.Accepted("", new { Command = c2Command });
+        logger.LogInformation("Piggybacking '{Command}' onto ACK for {DeviceId}", payload.Command, record.DeviceId);
+        // The framework will automatically serialize the payload (Command + Data) to JSON
+        return Results.Accepted("", payload); 
     }
 
-    return Results.Accepted(); // Normal ACK
+    return Results.Accepted(); 
 });
 
 app.Run();
@@ -107,3 +110,8 @@ app.Run();
 // 5. MODELS
 // ==========================================
 public record CommandRequest(string Command);
+
+// NEW: Data structures for the dynamic routing
+public record Coordinate(double Lat, double Lng);
+public record SwarmRouteRequest(string[] DeviceIds, Coordinate[] Route);
+public record C2Payload(string Command, object? Data = null);

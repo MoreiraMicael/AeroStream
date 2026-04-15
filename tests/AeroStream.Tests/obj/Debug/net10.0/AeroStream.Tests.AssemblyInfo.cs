@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("AeroStream.Tests")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+41c58913359b3b7041ae65e6621d8da294de8e81")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+6e4bcccd66930559b77f1aff700c9d2e8af1540c")]
 [assembly: System.Reflection.AssemblyProductAttribute("AeroStream.Tests")]
 [assembly: System.Reflection.AssemblyTitleAttribute("AeroStream.Tests")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
