@@ -8,7 +8,8 @@ public record TelemetryRecord(
     double Pitch,
     double Roll,
     double Yaw,
-    DateTime Timestamp
+    DateTime Timestamp,
+    double BatteryVoltage = 0.0   // Volts — populated by real hardware, 0 from simulator
 )
 {
     public double Altitude { 

@@ -27,6 +27,10 @@ interface Telemetry {
   longitude: number;
   altitude: number;
   speed: number;
+  pitch: number;
+  roll: number;
+  yaw: number;
+  batteryVoltage?: number;
   timestamp: string;
 }
 
@@ -44,11 +48,13 @@ function MapClickHandler({ isDrawing, onMapClick }: { isDrawing: boolean, onMapC
 
 
 function App() {
-  const dronesRef = useRef<Record<string, Telemetry>>({});
-  const pathsRef = useRef<Record<string, [number, number][]>>({});
+  const dronesRef   = useRef<Record<string, Telemetry>>({});
+  const pathsRef    = useRef<Record<string, [number, number][]>>({});
+  const lastSeenRef = useRef<Record<string, number>>({});
 
   const [drones, setDrones] = useState<Record<string, Telemetry>>({});
-  const [paths, setPaths] = useState<Record<string, [number, number][]>>({});
+  const [paths, setPaths]   = useState<Record<string, [number, number][]>>({});
+  const [lastSeen, setLastSeen] = useState<Record<string, number>>({});
   const [status, setStatus] = useState("DISCONNECTED");
 
   // NEW: State for the dynamic route planner
@@ -108,7 +114,8 @@ function App() {
       .then(() => {
         setStatus("LINK_OK");
         connection.on("ReceiveTelemetry", (data: Telemetry) => {
-          dronesRef.current[data.deviceId] = data;
+          dronesRef.current[data.deviceId]   = data;
+          lastSeenRef.current[data.deviceId] = Date.now();
 
           if (!pathsRef.current[data.deviceId]) {
             pathsRef.current[data.deviceId] = [];
@@ -125,6 +132,7 @@ function App() {
     const renderInterval = setInterval(() => {
         setDrones({ ...dronesRef.current });
         setPaths({ ...pathsRef.current });
+        setLastSeen({ ...lastSeenRef.current });
     }, 100); 
 
     return () => { 
@@ -172,19 +180,43 @@ function App() {
         <h4 style={{ margin: '0 0 15px 0', fontSize: '0.75rem', color: '#64748b' }}>SWARM_TELEMETRY</h4>
         {Object.values(drones).length === 0 && <span style={{ color: '#94a3b8' }}>AWAITING_SWARM...</span>}
         
-        {Object.values(drones).map(drone => (
-          <div key={drone.deviceId} style={{ fontSize: '0.8rem', borderBottom: '1px solid #f1f5f9', paddingBottom: '10px', marginBottom: '10px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <div>
-              ID: <strong style={{ color: '#3b82f6' }}>{drone.deviceId.substring(0,6)}</strong><br/>
-              ALT: {drone.altitude.toFixed(1)}m | SPD: {drone.speed.toFixed(0)}km/h
+        {Object.values(drones).map(drone => {
+          const stale    = (Date.now() - (lastSeen[drone.deviceId] ?? 0)) > 2000;
+          const batColor = !drone.batteryVoltage || drone.batteryVoltage === 0
+            ? '#94a3b8'
+            : drone.batteryVoltage < 20.0 ? '#dc2626'
+            : drone.batteryVoltage < 21.6 ? '#f59e0b'
+            : '#16a34a';
+          return (
+            <div key={drone.deviceId} style={{ fontSize: '0.8rem', borderBottom: '1px solid #f1f5f9', paddingBottom: '10px', marginBottom: '10px', opacity: stale ? 0.45 : 1 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' }}>
+                <span>
+                  ID: <strong style={{ color: stale ? '#94a3b8' : '#3b82f6' }}>{drone.deviceId.substring(0,6)}</strong>
+                  {stale && <span style={{ color: '#f59e0b', marginLeft: '6px', fontSize: '0.65rem' }}>STALE</span>}
+                </span>
+                <button
+                  onClick={() => issueRTL(drone.deviceId)}
+                  style={{ background: '#dc2626', color: 'white', border: 'none', padding: '3px 7px', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold', fontSize: '0.65rem' }}>
+                  RTL
+                </button>
+              </div>
+              <div style={{ color: '#475569' }}>
+                ALT <strong>{drone.altitude.toFixed(1)}</strong>m &nbsp;
+                SPD <strong>{drone.speed.toFixed(0)}</strong>km/h
+              </div>
+              <div style={{ color: '#475569' }}>
+                P <strong>{(drone.pitch ?? 0).toFixed(1)}</strong>°&nbsp;
+                R <strong>{(drone.roll  ?? 0).toFixed(1)}</strong>°&nbsp;
+                Y <strong>{(drone.yaw   ?? 0).toFixed(0)}</strong>°
+              </div>
+              {drone.batteryVoltage !== undefined && drone.batteryVoltage > 0 && (
+                <div style={{ color: batColor, fontWeight: 'bold' }}>
+                  BAT {drone.batteryVoltage.toFixed(1)}V
+                </div>
+              )}
             </div>
-            <button 
-              onClick={() => issueRTL(drone.deviceId)}
-              style={{ background: '#dc2626', color: 'white', border: 'none', padding: '4px 8px', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold', fontSize: '0.7rem' }}>
-              RTL
-            </button>
-          </div>
-        ))}
+          );
+        })}
       </aside>
 
       <MapContainer center={[39.586514, -9.021444]} zoom={14} zoomControl={false} style={{ height: "100%", width: "100%", cursor: isDrawMode ? 'crosshair' : 'grab' }}>
