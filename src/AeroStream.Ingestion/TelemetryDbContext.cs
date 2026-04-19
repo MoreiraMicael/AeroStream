@@ -15,5 +15,10 @@ protected override void OnModelCreating(ModelBuilder modelBuilder)
 
     modelBuilder.Entity<TelemetryRecord>()
         .HasKey("Id"); // Use the auto-id as the key instead of timestamp
+
+    // NEW: Composite index for lightning-fast historical lookups
+    modelBuilder.Entity<TelemetryRecord>()
+        .HasIndex(t => new { t.DeviceId, t.Timestamp })
+        .IsDescending(false, true); // Descending on Timestamp for recent-data queries
 }
 }

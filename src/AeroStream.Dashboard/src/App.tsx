@@ -1,6 +1,6 @@
 import { useEffect, useState, useRef } from 'react';
 import { HubConnectionBuilder } from '@microsoft/signalr';
-import { MapContainer, TileLayer, Marker, Popup, Polyline, useMapEvents } from 'react-leaflet';
+import { MapContainer, TileLayer, Marker, Popup, Polyline, Polygon, useMapEvents } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
 
@@ -35,10 +35,10 @@ interface Telemetry {
 }
 
 // NEW: Component to handle map clicks for drawing
-function MapClickHandler({ isDrawing, onMapClick }: { isDrawing: boolean, onMapClick: (latlng: [number, number]) => void }) {
+function MapClickHandler({ isDrawing, isDrawingGeofence, onMapClick }: { isDrawing: boolean, isDrawingGeofence: boolean, onMapClick: (latlng: [number, number]) => void }) {
     useMapEvents({
         click(e) {
-            if (isDrawing) {
+            if (isDrawing || isDrawingGeofence) {
                 onMapClick([e.latlng.lat, e.latlng.lng]);
             }
         }
@@ -60,6 +60,10 @@ function App() {
   // NEW: State for the dynamic route planner
   const [isDrawMode, setIsDrawMode] = useState(false);
   const [newRoute, setNewRoute] = useState<[number, number][]>([]);
+
+  // PHASE 3: State for geofence drawing
+  const [isDrawingGeofence, setIsDrawingGeofence] = useState(false);
+  const [geofencePolygon, setGeofencePolygon] = useState<[number, number][]>([]);
 
   // Existing RTL Command
   const issueRTL = async (deviceId: string) => {
@@ -101,6 +105,34 @@ function App() {
           setNewRoute([]);
       } catch (err) {
           console.error("Route Deployment Failed", err);
+      }
+  };
+
+  // PHASE 3: Deploy geofence to the backend
+  const deployGeofence = async () => {
+      if (geofencePolygon.length < 3) {
+          console.error("Geofence requires at least 3 vertices");
+          return;
+      }
+
+      const payload = {
+          coordinates: geofencePolygon.map(coord => ({ lat: coord[0], lng: coord[1] }))
+      };
+
+      try {
+          const response = await fetch(`http://localhost:5233/command/swarm/geofence`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload)
+          });
+          const result = await response.json();
+          console.log(`Geofence deployed with ${geofencePolygon.length} vertices:`, result);
+          
+          // Reset UI
+          setIsDrawingGeofence(false);
+          setGeofencePolygon([]);
+      } catch (err) {
+          console.error("Geofence Deployment Failed", err);
       }
   };
 
@@ -163,10 +195,27 @@ function App() {
                         Deploy Swarm Route ({newRoute.length} WPs)
                     </button>
                 </>
+            ) : isDrawingGeofence ? (
+                <>
+                    <button onClick={() => setGeofencePolygon([])} style={{ background: '#64748b', color: 'white', border: 'none', padding: '6px 12px', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' }}>
+                        Clear Geofence
+                    </button>
+                    <button onClick={() => setIsDrawingGeofence(false)} style={{ background: '#f87171', color: 'white', border: 'none', padding: '6px 12px', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' }}>
+                        Cancel
+                    </button>
+                    <button onClick={deployGeofence} disabled={geofencePolygon.length < 3} style={{ background: geofencePolygon.length < 3 ? '#9ca3af' : '#16a34a', color: 'white', border: 'none', padding: '6px 12px', borderRadius: '4px', cursor: geofencePolygon.length < 3 ? 'not-allowed' : 'pointer', fontWeight: 'bold' }}>
+                        Deploy Geofence ({geofencePolygon.length} vertices)
+                    </button>
+                </>
             ) : (
-                <button onClick={() => setIsDrawMode(true)} style={{ background: '#3b82f6', color: 'white', border: 'none', padding: '6px 12px', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' }}>
-                    + Draw Patrol Route
-                </button>
+                <>
+                    <button onClick={() => setIsDrawMode(true)} style={{ background: '#3b82f6', color: 'white', border: 'none', padding: '6px 12px', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' }}>
+                        + Draw Patrol Route
+                    </button>
+                    <button onClick={() => setIsDrawingGeofence(true)} style={{ background: '#8b5cf6', color: 'white', border: 'none', padding: '6px 12px', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' }}>
+                        🛡️ Draw Geofence
+                    </button>
+                </>
             )}
         </div>
 
@@ -219,11 +268,21 @@ function App() {
         })}
       </aside>
 
-      <MapContainer center={[39.586514, -9.021444]} zoom={14} zoomControl={false} style={{ height: "100%", width: "100%", cursor: isDrawMode ? 'crosshair' : 'grab' }}>
+      <MapContainer center={[39.586514, -9.021444]} zoom={14} zoomControl={false} style={{ height: "100%", width: "100%", cursor: isDrawMode || isDrawingGeofence ? 'crosshair' : 'grab' }}>
         <TileLayer url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png" />
         
         {/* NEW: Map Click Listener */}
-        <MapClickHandler isDrawing={isDrawMode} onMapClick={(coord) => setNewRoute([...newRoute, coord])} />
+        <MapClickHandler 
+            isDrawing={isDrawMode} 
+            isDrawingGeofence={isDrawingGeofence}
+            onMapClick={(coord) => {
+                if (isDrawMode) {
+                    setNewRoute([...newRoute, coord]);
+                } else if (isDrawingGeofence) {
+                    setGeofencePolygon([...geofencePolygon, coord]);
+                }
+            }} 
+        />
 
         {/* NEW: Draw the planned route preview */}
         {newRoute.length > 0 && (
@@ -231,6 +290,17 @@ function App() {
         )}
         {newRoute.map((coord, idx) => (
             <Marker key={`wp-${idx}`} position={coord} icon={WaypointIcon} />
+        ))}
+
+        {/* PHASE 3: Draw the geofence boundary */}
+        {geofencePolygon.length >= 3 && (
+            <Polygon 
+                positions={geofencePolygon} 
+                pathOptions={{ color: '#ef4444', weight: 3, fillColor: '#ef4444', fillOpacity: 0.2 }} 
+            />
+        )}
+        {geofencePolygon.map((coord, idx) => (
+            <Marker key={`geo-${idx}`} position={coord} icon={WaypointIcon} />
         ))}
 
         {/* Existing: Draw Drone Trails */}
