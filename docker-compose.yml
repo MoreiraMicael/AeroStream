@@ -4,7 +4,7 @@ services:
       container_name: aerostream-db
       environment:
         POSTGRES_USER: admin
-        POSTGRES_PASSWORD: password123
+        POSTGRES_PASSWORD: ${AEROSTREAM_DB_PASSWORD:-local-dev-password}
         POSTGRES_DB: aerostream
         PGDATA: /var/lib/postgresql/data/pgdata # MANDATORY FOR POSTGRES 18+
       ports:
@@ -22,7 +22,7 @@ services:
     depends_on:
       - db
     environment:
-      - ConnectionStrings__DefaultConnection=Host=db;Database=aerostream;Username=admin;Password=password123
+      - ConnectionStrings__DefaultConnection=Host=db;Database=aerostream;Username=admin;Password=${AEROSTREAM_DB_PASSWORD:-local-dev-password}
 
   # --- NEW: The Frontend UI ---
   dashboard:

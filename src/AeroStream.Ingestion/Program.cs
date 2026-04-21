@@ -56,12 +56,20 @@ builder.Services.AddSingleton<GeofenceState>();
 builder.Services.AddRateLimiter(options =>
 {
     options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
-    options.AddFixedWindowLimiter("telemetryPolicy", opt =>
+    options.AddPolicy("telemetryPolicy", httpContext =>
     {
-        opt.PermitLimit = 20; // Allow 20 Hz max per drone
-        opt.Window = TimeSpan.FromSeconds(1);
-        opt.QueueProcessingOrder = QueueProcessingOrder.OldestFirst;
-        opt.QueueLimit = 2; // Allow slight network jitter, then reject
+        var deviceId = httpContext.Request.Headers["X-Drone-Id"].ToString();
+        var partitionKey = !string.IsNullOrWhiteSpace(deviceId)
+            ? $"drone:{deviceId}"
+            : $"ip:{httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown"}";
+
+        return RateLimitPartition.GetFixedWindowLimiter(partitionKey, _ => new FixedWindowRateLimiterOptions
+        {
+            PermitLimit = 20, // Allow 20 Hz max per drone
+            Window = TimeSpan.FromSeconds(1),
+            QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+            QueueLimit = 2 // Allow slight network jitter, then reject
+        });
     });
 });
 
@@ -115,6 +123,23 @@ app.MapPost("/command/swarm/geofence", (GeofenceRequest req, GeofenceState geofe
     geofenceState.Boundary = req.Coordinates;
     logger.LogInformation("[GEOFENCE] Geofence deployed with {Count} vertices", req.Coordinates.Length);
     return Results.Ok(new { message = "Geofence deployed", vertexCount = req.Coordinates.Length });
+});
+
+app.MapPost("/admin/reset", async (
+    IDbContextFactory<TelemetryDbContext> dbFactory,
+    ConcurrentDictionary<string, C2Payload> commandQueue,
+    GeofenceState geofenceState,
+    ILogger<Program> logger,
+    CancellationToken cancellationToken) =>
+{
+    await using var db = await dbFactory.CreateDbContextAsync(cancellationToken);
+    var deletedTelemetry = await db.Telemetry.ExecuteDeleteAsync(cancellationToken);
+
+    commandQueue.Clear();
+    geofenceState.Boundary = null;
+
+    logger.LogWarning("[ADMIN] Database reset requested. Deleted {Count} telemetry rows and cleared command/geofence state.", deletedTelemetry);
+    return Results.Ok(new { deletedTelemetry, clearedCommands = true, clearedGeofence = true });
 });
 
 // The Telemetry Endpoint

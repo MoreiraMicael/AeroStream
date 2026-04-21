@@ -195,8 +195,10 @@ public class TelemetryDbContext(DbContextOptions<TelemetryDbContext> options)
 **Connection String (Docker Compose):**
 
 ```
-Host=db;Database=aerostream;Username=admin;Password=password123
+Host=db;Database=aerostream;Username=admin;Password=${AEROSTREAM_DB_PASSWORD:-local-dev-password}
 ```
+
+For public/shared repos, keep the actual password in a local `.env` file or shell environment instead of committing it.
 
 ---
 
@@ -456,7 +458,7 @@ node simulate.js
 
 - Dashboard: http://localhost:5173
 - API Health: http://localhost:5233/health
-- Database: localhost:5432 (admin/password123)
+- Database: localhost:5432 (admin / value from `AEROSTREAM_DB_PASSWORD` or local compose default)
 
 ---
 
