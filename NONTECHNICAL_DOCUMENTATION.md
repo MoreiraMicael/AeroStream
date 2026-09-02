@@ -138,13 +138,13 @@ A single drone sends about 10 data updates per second. With 10 drones, that's 10
 
 ✅ **Live Position Updates** — Updates arrive in real-time  
 ✅ **Data Persistence** — All flights recorded permanently  
-✅ **Command Delivery** — Commands reach drones >99% of time  
+✅ **Command Durability** — Commands queued durably; survive an API restart before delivery  
 ✅ **System Uptime** — Designed for 24/7 operation  
 
 ### What Could Fail
 
 ⚠️ **Drone Loses WiFi Signal** — System loses tracking  
-⚠️ **Backend Server Crashes** — Drones continue flying (but unmonitored)  
+⚠️ **Backend Server Crashes After Command Delivery** — If the server crashes between reading a command from the queue and delivering it to the next drone check-in, that command is lost. This is a known gap; the fix (persisting commands to the database) is on the roadmap.  
 ⚠️ **Network Overload** — System might drop some packets  
 
 ### Safety Best Practices
@@ -180,7 +180,7 @@ A single drone sends about 10 data updates per second. With 10 drones, that's 10
 
 ### Q: What if a drone doesn't receive my command?
 
-**A:** The command is delivered within 100-200ms if the drone is connected. If offline, it won't receive anything. Solution: Move closer, check WiFi, or manually land.
+**A:** The command is queued durably — if the server restarts before the drone checks in, the command is not lost. However, if the server crashes in the brief moment between reading the queued command and the drone's next check-in (typically under 200ms), the command is lost. In practice this is rare. If a command appears not to have reached the drone: verify the drone is connected (marker color), retry the command, or if urgent, intervene manually.
 
 ---
 
