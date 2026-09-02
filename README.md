@@ -7,6 +7,7 @@ It ingests telemetry, persists it to PostgreSQL, broadcasts live updates over Si
 ## Current Stack
 
 - Backend: .NET 10 Minimal API, SignalR, EF Core, Channels, Serilog
+- Messaging: RabbitMQ 4 (topic exchange, durable queues)
 - Frontend: React 19, TypeScript, Vite, React-Leaflet
 - Database: PostgreSQL 18
 - Runtime: Docker Compose
@@ -51,6 +52,7 @@ It ingests telemetry, persists it to PostgreSQL, broadcasts live updates over Si
 Defined in [docker-compose.yml](./docker-compose.yml):
 
 - `db`: PostgreSQL on `localhost:5432`
+- `rabbitmq`: RabbitMQ on `localhost:5672` (AMQP) / `localhost:15672` (management UI)
 - `ingestion-api`: backend API on `localhost:5233`
 - `dashboard`: built frontend served on `localhost:5173`
 
@@ -68,6 +70,7 @@ Open:
 
 - Dashboard: `http://localhost:5173`
 - API: `http://localhost:5233`
+- RabbitMQ management UI: `http://localhost:15672` (guest / guest)
 
 ### Run the simulator
 
@@ -124,9 +127,11 @@ npm run dev
 
 - Per-drone telemetry rate limiting using request partitioning
 - Geofence breach detection with immediate `RTL`
+- Battery critical detection (≤18V) with immediate `RTL`
 - Bounded ingestion channel
 - Batched persistence to PostgreSQL
 - SignalR real-time fanout
+- RabbitMQ topic exchange for durable command dispatch and alert events
 - Admin reset endpoint for telemetry wipe
 
 ## Important Endpoints
@@ -185,7 +190,7 @@ Credentials are defined in local runtime configuration and should be treated as 
 
 - Telemetry retention policy is not implemented yet
 - Historical telemetry is append-only until wiped or manually pruned
-- Commands are stored in memory, not durably queued
+- Commands consumed from RabbitMQ are held in-memory before drone delivery; a crash in that window still loses the command (full fix requires persisting pending commands to the database)
 - Simulator physics are operationally useful but still simplified
 
 ## Recommended Next Steps
