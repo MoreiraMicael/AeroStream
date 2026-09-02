@@ -1,6 +1,6 @@
 using AeroStream.Ingestion;
 using System.Threading.Channels;
-using Serilog; 
+using Serilog;
 using Scalar.AspNetCore;
 using Microsoft.EntityFrameworkCore;
 using System.Collections.Concurrent;
@@ -18,14 +18,17 @@ Log.Logger = new LoggerConfiguration()
     .Enrich.WithProperty("Application", "AeroStream")
     .CreateLogger();
 
-builder.Services.AddSerilog(); 
+builder.Services.AddSerilog();
 
 // ==========================================
 // 2. SERVICES & DEPENDENCY INJECTION
 // ==========================================
 builder.Services.AddOpenApi();
 builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddHealthChecks();
+
+builder.Services.AddHealthChecks()
+    .AddCheck<RabbitMqHealthCheck>("rabbitmq");
+
 builder.Services.AddSignalR();
 
 var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
@@ -36,23 +39,26 @@ builder.Services.AddCors(options =>
 {
     options.AddDefaultPolicy(policy =>
     {
-        policy.WithOrigins("http://localhost:5173", "http://localhost:5174") 
+        policy.WithOrigins("http://localhost:5173", "http://localhost:5174")
               .AllowAnyHeader()
               .AllowAnyMethod()
-              .AllowCredentials(); 
+              .AllowCredentials();
     });
 });
 
 builder.Services.AddSingleton(Channel.CreateBounded<TelemetryRecord>(1000));
 builder.Services.AddHostedService<TelemetryProcessor>();
 
-// UPGRADE: The dictionary now holds a complex C2Payload object, not just a string
 builder.Services.AddSingleton<ConcurrentDictionary<string, C2Payload>>();
 
-// PHASE 1: Geofence State Management
 builder.Services.AddSingleton<GeofenceState>();
 
-// NEW: Rate Limiter - Max 20 requests per second per IP (DDoS protection)
+// RabbitMQ: publisher singleton + consumer background service
+builder.Services.AddSingleton<RabbitMqPublisher>();
+builder.Services.AddSingleton<IRabbitMqPublisher>(sp => sp.GetRequiredService<RabbitMqPublisher>());
+builder.Services.AddHostedService(sp => sp.GetRequiredService<RabbitMqPublisher>());
+builder.Services.AddHostedService<CommandDispatchConsumer>();
+
 builder.Services.AddRateLimiter(options =>
 {
     options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
@@ -65,10 +71,10 @@ builder.Services.AddRateLimiter(options =>
 
         return RateLimitPartition.GetFixedWindowLimiter(partitionKey, _ => new FixedWindowRateLimiterOptions
         {
-            PermitLimit = 20, // Allow 20 Hz max per drone
+            PermitLimit = 20,
             Window = TimeSpan.FromSeconds(1),
             QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
-            QueueLimit = 2 // Allow slight network jitter, then reject
+            QueueLimit = 2
         });
     });
 });
@@ -76,7 +82,7 @@ builder.Services.AddRateLimiter(options =>
 var app = builder.Build();
 
 app.UseCors();
-app.UseRateLimiter(); // MUST be added before mapping endpoints
+app.UseRateLimiter();
 
 if (app.Environment.IsDevelopment())
 {
@@ -91,28 +97,22 @@ app.MapHub<TelemetryHub>("/telemetryHub");
 // 4. API ENDPOINTS
 // ==========================================
 
-// Existing Endpoint: Individual Drone Commands (e.g., RTL)
-app.MapPost("/command/{deviceId}", (string deviceId, CommandRequest req, ConcurrentDictionary<string, C2Payload> commandQueue, ILogger<Program> logger) => 
+app.MapPost("/command/{deviceId}", async (string deviceId, CommandRequest req, IRabbitMqPublisher publisher, ILogger<Program> logger) =>
 {
-    commandQueue[deviceId] = new C2Payload(req.Command);
-    logger.LogInformation("[C2] Command '{Command}' queued for Drone {DeviceId}", req.Command, deviceId);
+    var routingKey = req.Command == "RTL" ? "command.rtl" : "command.drone";
+    await publisher.PublishAsync(routingKey, new DispatchMessage([deviceId], req.Command, null));
+    logger.LogInformation("[C2] Command '{Command}' published for Drone {DeviceId}", req.Command, deviceId);
     return Results.Ok();
 });
 
-// NEW Endpoint: Global Swarm Route Update
-app.MapPost("/command/swarm/route", (SwarmRouteRequest req, ConcurrentDictionary<string, C2Payload> commandQueue, ILogger<Program> logger) => 
+app.MapPost("/command/swarm/route", async (SwarmRouteRequest req, IRabbitMqPublisher publisher, ILogger<Program> logger) =>
 {
-    // Loop through the provided drone IDs and assign the new route to each one
-    foreach(var id in req.DeviceIds) 
-    {
-        commandQueue[id] = new C2Payload("UPDATE_ROUTE", req.Route);
-    }
-    logger.LogInformation("[C2] UPDATE_ROUTE queued for {Count} drones", req.DeviceIds.Length);
+    await publisher.PublishAsync("command.swarm.route", new DispatchMessage(req.DeviceIds, "UPDATE_ROUTE", req.Route));
+    logger.LogInformation("[C2] UPDATE_ROUTE published for {Count} drones", req.DeviceIds.Length);
     return Results.Ok();
 });
 
-// PHASE 1: Geofence Endpoint - Deploy/Update Geofence
-app.MapPost("/command/swarm/geofence", (GeofenceRequest req, GeofenceState geofenceState, ILogger<Program> logger) =>
+app.MapPost("/command/swarm/geofence", async (GeofenceRequest req, GeofenceState geofenceState, IRabbitMqPublisher publisher, ILogger<Program> logger) =>
 {
     if (req.Coordinates == null || req.Coordinates.Length < 3)
     {
@@ -121,6 +121,7 @@ app.MapPost("/command/swarm/geofence", (GeofenceRequest req, GeofenceState geofe
     }
 
     geofenceState.Boundary = req.Coordinates;
+    _ = publisher.PublishAsync("command.swarm.geofence", new AlertMessage("swarm", "geofence_deployed", req.Coordinates.Length, DateTime.UtcNow));
     logger.LogInformation("[GEOFENCE] Geofence deployed with {Count} vertices", req.Coordinates.Length);
     return Results.Ok(new { message = "Geofence deployed", vertexCount = req.Coordinates.Length });
 });
@@ -142,40 +143,50 @@ app.MapPost("/admin/reset", async (
     return Results.Ok(new { deletedTelemetry, clearedCommands = true, clearedGeofence = true });
 });
 
-// The Telemetry Endpoint
-app.MapPost("/telemetry", (TelemetryRecord record, Channel<TelemetryRecord> channel, ConcurrentDictionary<string, C2Payload> commandQueue, GeofenceState geofenceState, ILogger<Program> logger) =>
+app.MapPost("/telemetry", (TelemetryRecord record, Channel<TelemetryRecord> channel, ConcurrentDictionary<string, C2Payload> commandQueue, GeofenceState geofenceState, IRabbitMqPublisher publisher, ILogger<Program> logger) =>
 {
     if (!channel.Writer.TryWrite(record))
     {
         logger.LogWarning("Ingestion queue full. Dropping packet for {DeviceId}", record.DeviceId);
         return Results.StatusCode(503);
     }
-    
-    // PHASE 2: Geofence Check - Ray-Casting Algorithm
+
+    var droneId = record.DeviceId.ToString();
+
+    // Battery critical check (18V matches simulator threshold)
+    const double BatteryCriticalV = 18.0;
+    if (record.BatteryVoltage > 0 && record.BatteryVoltage <= BatteryCriticalV)
+    {
+        logger.LogWarning("[BATTERY CRITICAL] Drone {DeviceId} at {Voltage:F1}V. RTL engaged.", droneId, record.BatteryVoltage);
+        _ = publisher.PublishAsync("telemetry.alert.battery", new AlertMessage(droneId, "battery_critical", record.BatteryVoltage, DateTime.UtcNow));
+        var batteryRtl = new C2Payload("RTL");
+        commandQueue[droneId] = batteryRtl;
+        return Results.Accepted("", batteryRtl);
+    }
+
+    // Geofence check — ray-casting
     if (geofenceState.Boundary != null && geofenceState.Boundary.Length >= 3)
     {
         var point = new Coordinate(record.Latitude, record.Longitude);
         bool isInsideGeofence = GeofenceHelper.IsPointInPolygon(point, geofenceState.Boundary);
-        
+
         if (!isInsideGeofence)
         {
-            logger.LogWarning("[GEOFENCE BREACH] Drone {DeviceId} exited boundary. RTL engaged.", record.DeviceId);
+            logger.LogWarning("[GEOFENCE BREACH] Drone {DeviceId} exited boundary. RTL engaged.", droneId);
+            _ = publisher.PublishAsync("telemetry.alert.geofence", new AlertMessage(droneId, "geofence_breach", 0, DateTime.UtcNow));
             var rtlPayload = new C2Payload("RTL");
-            commandQueue[record.DeviceId.ToString()] = rtlPayload;
-            // Return the RTL command immediately
+            commandQueue[droneId] = rtlPayload;
             return Results.Accepted("", rtlPayload);
         }
     }
-    
-    // UPGRADE: We now extract the C2Payload object and return it directly
-    if (commandQueue.TryRemove(record.DeviceId.ToString(), out var payload)) 
+
+    if (commandQueue.TryRemove(droneId, out var payload))
     {
         logger.LogInformation("Piggybacking '{Command}' onto ACK for {DeviceId}", payload.Command, record.DeviceId);
-        // The framework will automatically serialize the payload (Command + Data) to JSON
-        return Results.Accepted("", payload); 
+        return Results.Accepted("", payload);
     }
 
-    return Results.Accepted(); 
+    return Results.Accepted();
 }).RequireRateLimiting("telemetryPolicy");
 
 app.Run();
@@ -185,45 +196,26 @@ app.Run();
 // ==========================================
 public record CommandRequest(string Command);
 
-// NEW: Data structures for the dynamic routing
 public record Coordinate(double Lat, double Lng);
 public record SwarmRouteRequest(string[] DeviceIds, Coordinate[] Route);
 public record C2Payload(string Command, object? Data = null);
 
-// PHASE 1: Geofence Models
 public record GeofenceRequest(Coordinate[] Coordinates);
 
 public class GeofenceState
 {
     private readonly object _lock = new object();
     private Coordinate[]? _boundary;
-    
+
     public Coordinate[]? Boundary
     {
-        get
-        {
-            lock (_lock)
-            {
-                return _boundary;
-            }
-        }
-        set
-        {
-            lock (_lock)
-            {
-                _boundary = value;
-            }
-        }
+        get { lock (_lock) { return _boundary; } }
+        set { lock (_lock) { _boundary = value; } }
     }
 }
 
-// PHASE 2: Ray-Casting Algorithm Helper
 public static class GeofenceHelper
 {
-    /// <summary>
-    /// Point-in-Polygon using Ray-Casting algorithm.
-    /// Casts a horizontal ray from the point to infinity and counts boundary crossings.
-    /// </summary>
     public static bool IsPointInPolygon(Coordinate point, Coordinate[] polygon)
     {
         if (polygon.Length < 3) return false;
@@ -232,28 +224,20 @@ public static class GeofenceHelper
         for (int i = 0; i < polygon.Length; i++)
         {
             Coordinate a = polygon[i];
-            Coordinate b = polygon[(i + 1) % polygon.Length]; // Wrap to first vertex
+            Coordinate b = polygon[(i + 1) % polygon.Length];
 
-            // Check if ray crosses this edge
             if (IsRayIntersectingEdge(point, a, b))
-            {
                 crossings++;
-            }
         }
 
-        // Odd number of crossings = point is inside
         return crossings % 2 == 1;
     }
 
     private static bool IsRayIntersectingEdge(Coordinate point, Coordinate a, Coordinate b)
     {
-        // Edge must straddle the horizontal ray
         if ((a.Lat <= point.Lat && b.Lat > point.Lat) || (b.Lat <= point.Lat && a.Lat > point.Lat))
         {
-            // Calculate x-coordinate of intersection
             double xIntersect = a.Lng + (point.Lat - a.Lat) / (b.Lat - a.Lat) * (b.Lng - a.Lng);
-            
-            // Ray extends to the right (positive infinity)
             return point.Lng < xIntersect;
         }
 

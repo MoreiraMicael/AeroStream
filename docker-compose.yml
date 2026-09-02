@@ -1,37 +1,52 @@
 services:
   db:
-      image: postgres:latest
-      container_name: aerostream-db
-      environment:
-        POSTGRES_USER: admin
-        POSTGRES_PASSWORD: ${AEROSTREAM_DB_PASSWORD:-local-dev-password}
-        POSTGRES_DB: aerostream
-        PGDATA: /var/lib/postgresql/data/pgdata # MANDATORY FOR POSTGRES 18+
-      ports:
-        - "5432:5432"
-      volumes:
-        - pgdata:/var/lib/postgresql/data
+    image: postgres:latest
+    container_name: aerostream-db
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: ${AEROSTREAM_DB_PASSWORD:-local-dev-password}
+      POSTGRES_DB: aerostream
+      PGDATA: /var/lib/postgresql/data/pgdata # MANDATORY FOR POSTGRES 18+
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  rabbitmq:
+    image: rabbitmq:4-management
+    container_name: aerostream-rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_port_connectivity"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   ingestion-api:
-    build: 
+    build:
       context: .
       dockerfile: Dockerfile
     container_name: aerostream-api
     ports:
       - "5233:8080"
     depends_on:
-      - db
+      db:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
     environment:
       - ConnectionStrings__DefaultConnection=Host=db;Database=aerostream;Username=admin;Password=${AEROSTREAM_DB_PASSWORD:-local-dev-password}
+      - RabbitMq__Host=rabbitmq
 
-  # --- NEW: The Frontend UI ---
   dashboard:
     build:
       context: ./src/AeroStream.Dashboard
       dockerfile: Dockerfile
     container_name: aerostream-dashboard
     ports:
-      - "5173:80" # Maps local 5173 to Nginx's internal 80
+      - "5173:80"
     depends_on:
       - ingestion-api
 
