@@ -123,6 +123,20 @@ public class RabbitMqPublisherTests
         // Phase 2: broker reachable — must not throw.
         await publisher.PublishAsync("test.live", new { x = 2 });
         Assert.True(publisher.IsConnected);
+    public async Task PublishAsync_WhenNotConnected_DoesNotThrow()
+    {
+        // Publisher starts disconnected (StartAsync never called).
+        // Verifies silent degrade: logs warning, returns, does not throw.
+        var config = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?> { ["RabbitMq:Host"] = "nonexistent-host" })
+            .Build();
+
+        await using var publisher = new RabbitMqPublisher(config, NullLogger<RabbitMqPublisher>.Instance);
+
+        var ex = await Record.ExceptionAsync(() => publisher.PublishAsync("test.key", new { x = 1 }));
+
+        Assert.Null(ex);
+        Assert.False(publisher.IsConnected);
     }
 }
 
