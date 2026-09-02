@@ -32,6 +32,10 @@ public sealed class RabbitMqPublisher(IConfiguration config, ILogger<RabbitMqPub
     // Whoever arrives first creates it; the rest await the cached reference and get the real outcome.
     private readonly object _taskSync = new();
     private Task<bool>? _reconnectTask;
+    private IConnection? _connection;
+    private IChannel? _channel;
+    private bool _ready;
+    private readonly SemaphoreSlim _reconnectGate = new(1, 1);
 
     public bool IsConnected => _ready;
 
@@ -87,6 +91,28 @@ public sealed class RabbitMqPublisher(IConfiguration config, ILogger<RabbitMqPub
             _ready = false;
             throw new InvalidOperationException($"RabbitMQ publish failed: {ex.Message}", ex);
         }
+            // One reconnect attempt at a time; concurrent callers skip and log.
+            if (await _reconnectGate.WaitAsync(0))
+            {
+                try { await TryReconnectAsync(ct); }
+                finally { _reconnectGate.Release(); }
+            }
+
+            if (!_ready)
+            {
+                logger.LogWarning("RabbitMQ publish skipped (not connected). Key={Key}", routingKey);
+                return;
+            }
+        }
+
+        var body = JsonSerializer.SerializeToUtf8Bytes(message, s_jsonOptions);
+        await _channel!.BasicPublishAsync(
+            exchange: "aerostream.events",
+            routingKey: routingKey,
+            mandatory: false,
+            basicProperties: new BasicProperties { Persistent = true },
+            body: body,
+            cancellationToken: ct);
     }
 
     public Task StopAsync(CancellationToken ct)
@@ -98,6 +124,7 @@ public sealed class RabbitMqPublisher(IConfiguration config, ILogger<RabbitMqPub
     public async ValueTask DisposeAsync()
     {
         _ready = false;
+        _reconnectGate.Dispose();
         if (_channel is not null) { await _channel.DisposeAsync(); _channel = null; }
         if (_connection is not null) { await _connection.DisposeAsync(); _connection = null; }
     }
@@ -119,6 +146,7 @@ public sealed class RabbitMqPublisher(IConfiguration config, ILogger<RabbitMqPub
     // individual request's cancellation token. A request cancelling shouldn't abort a reconnect
     // that other concurrent callers are also waiting on.
     private async Task<bool> DoReconnectAsync()
+    private async Task TryReconnectAsync(CancellationToken ct)
     {
         try
         {
@@ -127,6 +155,7 @@ public sealed class RabbitMqPublisher(IConfiguration config, ILogger<RabbitMqPub
             if (_connection is not null) { await _connection.DisposeAsync(); _connection = null; }
             await ConnectAsync(CancellationToken.None);
             return true;
+            await ConnectAsync(ct);
         }
         catch (Exception ex)
         {
