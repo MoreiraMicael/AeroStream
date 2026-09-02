@@ -46,8 +46,9 @@ const updateBattery = (drone) => {
 // Initialize Swarm
 const drones = Array.from({ length: SWARM_SIZE }).map((_, i) => {
     const type = i < PATROL_COUNT ? 'PATROL' : 'HUNTER';
+    const typeIndex = type === 'PATROL' ? i + 1 : i - PATROL_COUNT + 1;
     return {
-        id: crypto.randomUUID(),
+        id: `${type}-${String(typeIndex).padStart(3, '0')}`,
         type,
         lat: baseCoords.lat + (Math.random() - 0.5) * 0.0004,
         lng: baseCoords.lng + (Math.random() - 0.5) * 0.0004,
