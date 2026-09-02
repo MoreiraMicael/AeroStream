@@ -17,6 +17,7 @@ public sealed class RabbitMqPublisher(IConfiguration config, ILogger<RabbitMqPub
     private IConnection? _connection;
     private IChannel? _channel;
     private bool _ready;
+    private readonly SemaphoreSlim _reconnectGate = new(1, 1);
 
     public bool IsConnected => _ready;
 
@@ -26,15 +27,7 @@ public sealed class RabbitMqPublisher(IConfiguration config, ILogger<RabbitMqPub
         {
             try
             {
-                _connection = await BuildFactory().CreateConnectionAsync(ct);
-                _channel = await _connection.CreateChannelAsync(cancellationToken: ct);
-                await _channel.ExchangeDeclareAsync(
-                    exchange: "aerostream.events",
-                    type: ExchangeType.Topic,
-                    durable: true,
-                    cancellationToken: ct);
-                _ready = true;
-                logger.LogInformation("RabbitMQ publisher connected to {Host}.", config["RabbitMq:Host"]);
+                await ConnectAsync(ct);
                 return;
             }
             catch (Exception ex) when (!ct.IsCancellationRequested)
@@ -47,14 +40,24 @@ public sealed class RabbitMqPublisher(IConfiguration config, ILogger<RabbitMqPub
 
     public async Task PublishAsync(string routingKey, object message, CancellationToken ct = default)
     {
-        if (_channel is null || !_ready)
+        if (!_ready || _channel is null)
         {
-            logger.LogWarning("RabbitMQ publish skipped (not connected). Key={Key}", routingKey);
-            return;
+            // One reconnect attempt at a time; concurrent callers skip and log.
+            if (await _reconnectGate.WaitAsync(0))
+            {
+                try { await TryReconnectAsync(ct); }
+                finally { _reconnectGate.Release(); }
+            }
+
+            if (!_ready)
+            {
+                logger.LogWarning("RabbitMQ publish skipped (not connected). Key={Key}", routingKey);
+                return;
+            }
         }
 
         var body = JsonSerializer.SerializeToUtf8Bytes(message, s_jsonOptions);
-        await _channel.BasicPublishAsync(
+        await _channel!.BasicPublishAsync(
             exchange: "aerostream.events",
             routingKey: routingKey,
             mandatory: false,
@@ -72,8 +75,37 @@ public sealed class RabbitMqPublisher(IConfiguration config, ILogger<RabbitMqPub
     public async ValueTask DisposeAsync()
     {
         _ready = false;
+        _reconnectGate.Dispose();
         if (_channel is not null) { await _channel.DisposeAsync(); _channel = null; }
         if (_connection is not null) { await _connection.DisposeAsync(); _connection = null; }
+    }
+
+    private async Task ConnectAsync(CancellationToken ct)
+    {
+        _connection = await BuildFactory().CreateConnectionAsync(ct);
+        _channel = await _connection.CreateChannelAsync(cancellationToken: ct);
+        await _channel.ExchangeDeclareAsync(
+            exchange: "aerostream.events",
+            type: ExchangeType.Topic,
+            durable: true,
+            cancellationToken: ct);
+        _ready = true;
+        logger.LogInformation("RabbitMQ publisher connected to {Host}.", config["RabbitMq:Host"]);
+    }
+
+    private async Task TryReconnectAsync(CancellationToken ct)
+    {
+        try
+        {
+            _ready = false;
+            if (_channel is not null) { await _channel.DisposeAsync(); _channel = null; }
+            if (_connection is not null) { await _connection.DisposeAsync(); _connection = null; }
+            await ConnectAsync(ct);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning("RabbitMQ publisher reconnect failed: {Msg}", ex.Message);
+        }
     }
 
     private ConnectionFactory BuildFactory() => new()

@@ -35,34 +35,48 @@ public class CommandDispatchConsumer(
 
                 await channel.BasicQosAsync(prefetchSize: 0, prefetchCount: 10, global: false, cancellationToken: stoppingToken);
 
-                var consumer = new AsyncEventingBasicConsumer(channel);
-                consumer.ReceivedAsync += async (_, ea) =>
+                // Command consumer — writes to in-memory commandQueue for drone ACK piggybacking.
+                // Ack guarantee: survives API restart before consumption; a crash after ack but before
+                // drone telemetry still loses the command (full fix = persist commandQueue to DB).
+                var commandConsumer = new AsyncEventingBasicConsumer(channel);
+                commandConsumer.ReceivedAsync += async (_, ea) =>
                 {
                     try
                     {
                         var json = Encoding.UTF8.GetString(ea.Body.Span);
-                        var msg = JsonSerializer.Deserialize<DispatchMessage>(json, s_jsonOptions);
-
-                        if (msg is { DroneIds.Length: > 0 })
-                        {
-                            foreach (var droneId in msg.DroneIds)
-                            {
-                                commandQueue[droneId] = new C2Payload(msg.Command, msg.Data);
-                                logger.LogInformation("[MQ] Dispatched '{Command}' for drone {DroneId}", msg.Command, droneId);
-                            }
-                        }
-
+                        ProcessMessage(json, commandQueue);
                         await channel.BasicAckAsync(ea.DeliveryTag, multiple: false);
                     }
                     catch (Exception ex)
                     {
-                        logger.LogError("[MQ] Message processing failed: {Msg}", ex.Message);
-                        await channel.BasicNackAsync(ea.DeliveryTag, multiple: false, requeue: false);
+                        logger.LogError("[MQ] Command message processing failed: {Msg}", ex.Message);
+                        await channel.BasicNackAsync(ea.DeliveryTag, multiple: false, requeue: true);
                     }
                 };
+                await channel.BasicConsumeAsync("command-dispatch-queue", autoAck: false, consumer: commandConsumer, cancellationToken: stoppingToken);
 
-                await channel.BasicConsumeAsync("command-dispatch-queue", autoAck: false, consumer: consumer, cancellationToken: stoppingToken);
-                logger.LogInformation("CommandDispatchConsumer listening on command-dispatch-queue.");
+                // Alert consumer — drains telemetry-alert-queue, writes to Serilog only.
+                var alertConsumer = new AsyncEventingBasicConsumer(channel);
+                alertConsumer.ReceivedAsync += async (_, ea) =>
+                {
+                    try
+                    {
+                        var json = Encoding.UTF8.GetString(ea.Body.Span);
+                        var alert = JsonSerializer.Deserialize<AlertMessage>(json, s_jsonOptions);
+                        if (alert is not null)
+                            logger.LogWarning("[ALERT] {AlertType} — Drone {DroneId} — Value: {Value:F1} at {Timestamp:O}",
+                                alert.AlertType, alert.DroneId, alert.Value, alert.Timestamp);
+                        await channel.BasicAckAsync(ea.DeliveryTag, multiple: false);
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError("[ALERT] Consumer failed: {Msg}", ex.Message);
+                        await channel.BasicNackAsync(ea.DeliveryTag, multiple: false, requeue: true);
+                    }
+                };
+                await channel.BasicConsumeAsync("telemetry-alert-queue", autoAck: false, consumer: alertConsumer, cancellationToken: stoppingToken);
+
+                logger.LogInformation("CommandDispatchConsumer started. Consuming command-dispatch-queue and telemetry-alert-queue.");
 
                 await Task.Delay(Timeout.Infinite, stoppingToken);
             }
@@ -81,6 +95,16 @@ public class CommandDispatchConsumer(
                 if (connection is not null) await connection.DisposeAsync();
             }
         }
+    }
+
+    // Extracted for unit testability — throws on bad JSON so the caller can nack.
+    public static void ProcessMessage(string json, ConcurrentDictionary<string, C2Payload> commandQueue)
+    {
+        var msg = JsonSerializer.Deserialize<DispatchMessage>(json, s_jsonOptions);
+        if (msg is not { DroneIds.Length: > 0 }) return;
+
+        foreach (var droneId in msg.DroneIds)
+            commandQueue[droneId] = new C2Payload(msg.Command, msg.Data);
     }
 
     private ConnectionFactory BuildFactory() => new()
