@@ -115,10 +115,6 @@ app.MapPost("/command/{deviceId}", async (string deviceId, CommandRequest req, I
         logger.LogError("[C2] Failed to publish command for {DeviceId}: {Msg}", deviceId, ex.Message);
         return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
     }
-    var routingKey = req.Command == "RTL" ? "command.rtl" : "command.drone";
-    await publisher.PublishAsync(routingKey, new DispatchMessage([deviceId], req.Command, null));
-    logger.LogInformation("[C2] Command '{Command}' published for Drone {DeviceId}", req.Command, deviceId);
-    return Results.Ok();
 });
 
 app.MapPost("/command/swarm/route", async (SwarmRouteRequest req, IRabbitMqPublisher publisher, ILogger<Program> logger) =>
@@ -134,9 +130,6 @@ app.MapPost("/command/swarm/route", async (SwarmRouteRequest req, IRabbitMqPubli
         logger.LogError("[C2] Failed to publish swarm route: {Msg}", ex.Message);
         return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
     }
-    await publisher.PublishAsync("command.swarm.route", new DispatchMessage(req.DeviceIds, "UPDATE_ROUTE", req.Route));
-    logger.LogInformation("[C2] UPDATE_ROUTE published for {Count} drones", req.DeviceIds.Length);
-    return Results.Ok();
 });
 
 app.MapPost("/command/swarm/geofence", async (GeofenceRequest req, GeofenceState geofenceState, IRabbitMqPublisher publisher, ILogger<Program> logger) =>
@@ -149,10 +142,9 @@ app.MapPost("/command/swarm/geofence", async (GeofenceRequest req, GeofenceState
 
     geofenceState.Boundary = req.Coordinates;
     // Geofence state already updated; publish is supplementary — don't fail the response on broker issues.
-    publisher.PublishAsync("command.swarm.geofence", new AlertMessage("swarm", "geofence_deployed", req.Coordinates.Length, DateTime.UtcNow))
+    _ = publisher.PublishAsync("command.swarm.geofence", new AlertMessage("swarm", "geofence_deployed", req.Coordinates.Length, DateTime.UtcNow))
         .ContinueWith(t => logger.LogWarning("[GEOFENCE] Event publish failed: {Msg}", t.Exception!.GetBaseException().Message),
             TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously);
-    _ = publisher.PublishAsync("command.swarm.geofence", new AlertMessage("swarm", "geofence_deployed", req.Coordinates.Length, DateTime.UtcNow));
     logger.LogInformation("[GEOFENCE] Geofence deployed with {Count} vertices", req.Coordinates.Length);
     return Results.Ok(new { message = "Geofence deployed", vertexCount = req.Coordinates.Length });
 });

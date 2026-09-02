@@ -44,15 +44,9 @@ public class CommandDispatchConsumer(
                 await channel.QueueDeclareAsync("command-dispatch-queue", durable: true, exclusive: false, autoDelete: false, arguments: dlxArgs, cancellationToken: stoppingToken);
                 await channel.QueueBindAsync("command-dispatch-queue", "aerostream.events", "command.#", cancellationToken: stoppingToken);
                 await channel.QueueDeclareAsync("telemetry-alert-queue", durable: true, exclusive: false, autoDelete: false, arguments: dlxArgs, cancellationToken: stoppingToken);
-                await channel.QueueDeclareAsync("command-dispatch-queue", durable: true, exclusive: false, autoDelete: false, cancellationToken: stoppingToken);
-                await channel.QueueBindAsync("command-dispatch-queue", "aerostream.events", "command.#", cancellationToken: stoppingToken);
-                await channel.QueueDeclareAsync("telemetry-alert-queue", durable: true, exclusive: false, autoDelete: false, cancellationToken: stoppingToken);
                 await channel.QueueBindAsync("telemetry-alert-queue", "aerostream.events", "telemetry.alert.#", cancellationToken: stoppingToken);
                 await channel.BasicQosAsync(prefetchSize: 0, prefetchCount: 10, global: false, cancellationToken: stoppingToken);
 
-                // Command consumer.
-                // Ack guarantee: survives API restart before consumption; a crash after ack but before
-                // drone telemetry delivery still loses the command (full fix = persist commandQueue to DB).
                 // Command consumer — writes to in-memory commandQueue for drone ACK piggybacking.
                 // Ack guarantee: survives API restart before consumption; a crash after ack but before
                 // drone telemetry still loses the command (full fix = persist commandQueue to DB).
@@ -80,11 +74,6 @@ public class CommandDispatchConsumer(
                         logger.LogError("[MQ] Transient command processing error (requeue): {Msg}", ex.Message);
                         await channel.BasicNackAsync(ea.DeliveryTag, multiple: false, requeue: true);
                         s_consumed.WithLabels("command-dispatch-queue", "nack_requeue").Inc();
-                    }
-                    catch (Exception ex)
-                    {
-                        logger.LogError("[MQ] Command message processing failed: {Msg}", ex.Message);
-                        await channel.BasicNackAsync(ea.DeliveryTag, multiple: false, requeue: true);
                     }
                 };
                 await channel.BasicConsumeAsync("command-dispatch-queue", autoAck: false, consumer: commandConsumer, cancellationToken: stoppingToken);
@@ -114,11 +103,6 @@ public class CommandDispatchConsumer(
                         logger.LogError("[ALERT] Transient consumer error (requeue): {Msg}", ex.Message);
                         await channel.BasicNackAsync(ea.DeliveryTag, multiple: false, requeue: true);
                         s_consumed.WithLabels("telemetry-alert-queue", "nack_requeue").Inc();
-                    }
-                    catch (Exception ex)
-                    {
-                        logger.LogError("[ALERT] Consumer failed: {Msg}", ex.Message);
-                        await channel.BasicNackAsync(ea.DeliveryTag, multiple: false, requeue: true);
                     }
                 };
                 await channel.BasicConsumeAsync("telemetry-alert-queue", autoAck: false, consumer: alertConsumer, cancellationToken: stoppingToken);
