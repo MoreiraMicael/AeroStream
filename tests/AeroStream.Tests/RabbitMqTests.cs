@@ -72,6 +72,57 @@ public class CommandDispatchConsumerTests
 public class RabbitMqPublisherTests
 {
     [Fact]
+    public async Task PublishAsync_WhenNotConnected_ThrowsInvalidOperationException()
+    {
+        // Port 1 → immediate "connection refused" rather than a long DNS/TCP timeout.
+        var config = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["RabbitMq:Host"] = "127.0.0.1",
+                ["RabbitMq:Port"] = "1",
+            })
+            .Build();
+
+        await using var publisher = new RabbitMqPublisher(config, NullLogger<RabbitMqPublisher>.Instance);
+        // StartAsync not called — publisher is disconnected.
+
+        // Publisher must throw so callers (endpoints) can return 503 instead of silently dropping.
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            publisher.PublishAsync("test.key", new { x = 1 }));
+        Assert.False(publisher.IsConnected);
+    }
+
+    [Fact]
+    public async Task PublishAsync_AfterFailedReconnect_SucceedsWhenBrokerAvailable()
+    {
+        // Simulates a broker restart. Without the finally-block null-clear in DoReconnectAsync,
+        // _reconnectTask would remain a completed Task<bool>(false) after the first failure.
+        // The second call would hit ??= with a non-null task, skip creating a new one, and
+        // throw immediately — never attempting TCP even though the broker is now reachable.
+        var config = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["RabbitMq:Host"] = "127.0.0.1",
+                ["RabbitMq:Port"] = "1",
+            })
+            .Build();
+
+        await using var publisher = new RabbitMqPublisher(config, NullLogger<RabbitMqPublisher>.Instance);
+
+        // Phase 1: broker unreachable — must throw.
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            publisher.PublishAsync("test.refused", new { x = 1 }));
+        Assert.False(publisher.IsConnected);
+
+        // "Broker restarts": update config to point at live RabbitMQ.
+        // IConfiguration.set propagates through ConfigurationRoot → MemoryConfigurationProvider.Data,
+        // so the next BuildFactory() call inside DoReconnectAsync reads the new values.
+        config["RabbitMq:Host"] = "localhost";
+        config["RabbitMq:Port"] = "5672";
+
+        // Phase 2: broker reachable — must not throw.
+        await publisher.PublishAsync("test.live", new { x = 2 });
+        Assert.True(publisher.IsConnected);
     public async Task PublishAsync_WhenNotConnected_DoesNotThrow()
     {
         // Publisher starts disconnected (StartAsync never called).

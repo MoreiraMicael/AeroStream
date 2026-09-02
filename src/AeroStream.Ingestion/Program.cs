@@ -6,6 +6,7 @@ using Microsoft.EntityFrameworkCore;
 using System.Collections.Concurrent;
 using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.RateLimiting;
+using Prometheus;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -91,6 +92,7 @@ if (app.Environment.IsDevelopment())
 }
 
 app.MapHealthChecks("/health");
+app.MapMetrics();
 app.MapHub<TelemetryHub>("/telemetryHub");
 
 // ==========================================
@@ -99,6 +101,20 @@ app.MapHub<TelemetryHub>("/telemetryHub");
 
 app.MapPost("/command/{deviceId}", async (string deviceId, CommandRequest req, IRabbitMqPublisher publisher, ILogger<Program> logger) =>
 {
+    try
+    {
+        var routingKey = req.Command == "RTL" ? "command.rtl" : "command.drone";
+        await publisher.PublishAsync(routingKey, new DispatchMessage([deviceId], req.Command, null));
+        logger.LogInformation("[C2] Command '{Command}' published for Drone {DeviceId}", req.Command, deviceId);
+        if (req.Command == "RTL")
+            IngestMetrics.RtlTriggered.WithLabels("operator_manual").Inc();
+        return Results.Ok();
+    }
+    catch (Exception ex)
+    {
+        logger.LogError("[C2] Failed to publish command for {DeviceId}: {Msg}", deviceId, ex.Message);
+        return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+    }
     var routingKey = req.Command == "RTL" ? "command.rtl" : "command.drone";
     await publisher.PublishAsync(routingKey, new DispatchMessage([deviceId], req.Command, null));
     logger.LogInformation("[C2] Command '{Command}' published for Drone {DeviceId}", req.Command, deviceId);
@@ -107,6 +123,17 @@ app.MapPost("/command/{deviceId}", async (string deviceId, CommandRequest req, I
 
 app.MapPost("/command/swarm/route", async (SwarmRouteRequest req, IRabbitMqPublisher publisher, ILogger<Program> logger) =>
 {
+    try
+    {
+        await publisher.PublishAsync("command.swarm.route", new DispatchMessage(req.DeviceIds, "UPDATE_ROUTE", req.Route));
+        logger.LogInformation("[C2] UPDATE_ROUTE published for {Count} drones", req.DeviceIds.Length);
+        return Results.Ok();
+    }
+    catch (Exception ex)
+    {
+        logger.LogError("[C2] Failed to publish swarm route: {Msg}", ex.Message);
+        return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+    }
     await publisher.PublishAsync("command.swarm.route", new DispatchMessage(req.DeviceIds, "UPDATE_ROUTE", req.Route));
     logger.LogInformation("[C2] UPDATE_ROUTE published for {Count} drones", req.DeviceIds.Length);
     return Results.Ok();
@@ -121,6 +148,10 @@ app.MapPost("/command/swarm/geofence", async (GeofenceRequest req, GeofenceState
     }
 
     geofenceState.Boundary = req.Coordinates;
+    // Geofence state already updated; publish is supplementary — don't fail the response on broker issues.
+    publisher.PublishAsync("command.swarm.geofence", new AlertMessage("swarm", "geofence_deployed", req.Coordinates.Length, DateTime.UtcNow))
+        .ContinueWith(t => logger.LogWarning("[GEOFENCE] Event publish failed: {Msg}", t.Exception!.GetBaseException().Message),
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously);
     _ = publisher.PublishAsync("command.swarm.geofence", new AlertMessage("swarm", "geofence_deployed", req.Coordinates.Length, DateTime.UtcNow));
     logger.LogInformation("[GEOFENCE] Geofence deployed with {Count} vertices", req.Coordinates.Length);
     return Results.Ok(new { message = "Geofence deployed", vertexCount = req.Coordinates.Length });
@@ -152,12 +183,18 @@ app.MapPost("/telemetry", (TelemetryRecord record, Channel<TelemetryRecord> chan
     }
 
     var droneId = record.DeviceId.ToString();
+    IngestMetrics.TelemetryReceived.WithLabels(droneId).Inc();
+    TelemetryProcessor.ChannelDepth.Inc();
 
     // Battery critical check (18V matches simulator threshold)
     const double BatteryCriticalV = 18.0;
     if (record.BatteryVoltage > 0 && record.BatteryVoltage <= BatteryCriticalV)
     {
         logger.LogWarning("[BATTERY CRITICAL] Drone {DeviceId} at {Voltage:F1}V. RTL engaged.", droneId, record.BatteryVoltage);
+        publisher.PublishAsync("telemetry.alert.battery", new AlertMessage(droneId, "battery_critical", record.BatteryVoltage, DateTime.UtcNow))
+            .ContinueWith(t => logger.LogWarning("[ALERT] Battery alert publish failed: {Msg}", t.Exception!.GetBaseException().Message),
+                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously);
+        IngestMetrics.RtlTriggered.WithLabels("battery_critical").Inc();
         _ = publisher.PublishAsync("telemetry.alert.battery", new AlertMessage(droneId, "battery_critical", record.BatteryVoltage, DateTime.UtcNow));
         var batteryRtl = new C2Payload("RTL");
         commandQueue[droneId] = batteryRtl;
@@ -173,6 +210,11 @@ app.MapPost("/telemetry", (TelemetryRecord record, Channel<TelemetryRecord> chan
         if (!isInsideGeofence)
         {
             logger.LogWarning("[GEOFENCE BREACH] Drone {DeviceId} exited boundary. RTL engaged.", droneId);
+            publisher.PublishAsync("telemetry.alert.geofence", new AlertMessage(droneId, "geofence_breach", 0, DateTime.UtcNow))
+                .ContinueWith(t => logger.LogWarning("[ALERT] Geofence alert publish failed: {Msg}", t.Exception!.GetBaseException().Message),
+                    TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously);
+            IngestMetrics.GeofenceBreach.Inc();
+            IngestMetrics.RtlTriggered.WithLabels("geofence").Inc();
             _ = publisher.PublishAsync("telemetry.alert.geofence", new AlertMessage(droneId, "geofence_breach", 0, DateTime.UtcNow));
             var rtlPayload = new C2Payload("RTL");
             commandQueue[droneId] = rtlPayload;
@@ -212,6 +254,23 @@ public class GeofenceState
         get { lock (_lock) { return _boundary; } }
         set { lock (_lock) { _boundary = value; } }
     }
+}
+
+internal static class IngestMetrics
+{
+    internal static readonly Counter TelemetryReceived = Metrics.CreateCounter(
+        "aerostream_telemetry_received_total",
+        "Telemetry packets accepted into the ingestion channel.",
+        new CounterConfiguration { LabelNames = ["drone_id"] });
+
+    internal static readonly Counter GeofenceBreach = Metrics.CreateCounter(
+        "aerostream_geofence_breach_total",
+        "Geofence breach events detected.");
+
+    internal static readonly Counter RtlTriggered = Metrics.CreateCounter(
+        "aerostream_rtl_triggered_total",
+        "RTL commands triggered.",
+        new CounterConfiguration { LabelNames = ["reason"] });
 }
 
 public static class GeofenceHelper

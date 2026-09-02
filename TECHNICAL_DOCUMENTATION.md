@@ -77,11 +77,15 @@ Drone Telemetry → API (TryWrite to Channel, 202 Accepted) →
 | **ORM** | Entity Framework Core | 10.0 | Type-safe database queries and schema management |
 | **DB Driver** | Npgsql | 10.0.1 | PostgreSQL wire protocol implementation |
 | **Database** | PostgreSQL | 18 | ACID-compliant relational store |
+| **Messaging** | RabbitMQ | 4 | Durable topic exchange; command dispatch + alert fanout |
+| **Metrics** | prometheus-net.AspNetCore | 8.2.1 | Prometheus exposition at `/metrics`; `UseHttpMetrics()` |
+| **Observability** | Prometheus | Latest | 5s scrape; time-series store |
+| **Dashboards** | Grafana | 13 | File-provisioned datasource + 7-panel dashboard |
 | **Frontend Framework** | React | 19 | Component-based UI library |
 | **Frontend Toolchain** | Vite | Latest | Fast bundler and dev server |
 | **Maps** | React-Leaflet + CartoDB | Latest | Geospatial visualization |
 | **Logging** | Serilog + AspNetCore | 10.0 | Structured logging to console |
-| **Infrastructure** | Docker Compose | Latest | Multi-container orchestration |
+| **Infrastructure** | Docker Compose | Latest | Multi-container orchestration (6 services) |
 | **Firmware SDK** | PlatformIO | Latest | ESP32 C++ build and deploy |
 | **Serialization** | System.Text.Json | Built-in | JSON encode/decode (auto-camelCase) |
 
@@ -102,26 +106,43 @@ flowchart TD
   F -->|Batch 50<br/>or 500ms| H["PostgreSQL DB"]
   G -->|Real-time Data| I["Pilot Dashboard"]
   H -->|Historical Records| J["Flight History Queries"]
+  B -->|battery_critical / geofence_breach| K["RabbitMQ<br/>topic exchange"]
+  K -->|telemetry.alert.*| L["CommandDispatchConsumer<br/>(alert branch)"]
+  M["POST /command/{id}"] -->|publish command.*| K
+  K -->|command-dispatch-queue| N["CommandDispatchConsumer<br/>(command branch)"]
+  N -->|in-memory dict| O["Next telemetry ACK"]
+  P["Prometheus"] -->|scrape /metrics every 5s| B
+  P -->|datasource| Q["Grafana Dashboard"]
 ```
 
 ### Sequence (Per Telemetry Update)
 
 ```
 1. Drone POSTs telemetry record
-2. API receives, validates (basic)
+2. API validates rate limit (20 req/s per drone; 429 captured by UseHttpMetrics before UseRateLimiter)
 3. Channel.Writer.TryWrite(record)
-   a. Success: return 202 + any queued command
+   a. Success: Inc() channel depth gauge; proceed
    b. Full: log warning, return 503
-4. [Async] Processor consumes from channel
-5. Processor broadcasts via SignalR (all clients receive) - IMMEDIATE
-6. Processor adds record to batch accumulator
-7. When batch reaches 50 OR 500ms elapsed:
+4. Battery check: if BatteryVoltage <= 18V → publish telemetry.alert.battery to RabbitMQ; return RTL C2Payload
+5. Geofence check: if deployed + point outside polygon → publish telemetry.alert.geofence; return RTL C2Payload
+6. Check in-memory command dict; if pending command, return in 202 body
+7. [Async] Processor consumes from channel
+   a. Dec() channel depth gauge
+   b. Broadcast via SignalR (all clients receive) - IMMEDIATE
+   c. Add record to batch accumulator
+8. When batch reaches 50 OR 500ms elapsed:
    a. Create DbContext from factory
-   b. Call db.Telemetry.AddRange(batch)  ← Bulk insert
-   c. Call await db.SaveChangesAsync()   ← Single round-trip
+   b. db.Telemetry.AddRange(batch)  ← Bulk insert
+   c. await db.SaveChangesAsync()   ← Single round-trip; BatchDuration.WithLabels("success"/"failure").Observe()
    d. Log completion
-8. If error: log, continue (don't crash loop)
-9. [Next cycle]
+9. If DB error: log, continue (don't crash loop)
+
+Operator command sequence:
+1. Dashboard POSTs /command/{deviceId}
+2. API publishes to RabbitMQ (command.rtl or command.drone)
+3. CommandDispatchConsumer reads from command-dispatch-queue (durable, acked)
+4. Consumer writes command into ConcurrentDictionary<droneId, C2Payload>
+5. Next POST /telemetry from that drone returns the command in the 202 body
 ```
 
 ---
@@ -279,13 +300,35 @@ Status: 200 OK
 
 **Endpoint:** `GET /health`
 
-**Response:** `200 OK`
+**Response:** `200 OK` — includes RabbitMQ connectivity check via `IHealthCheck`
 
 ---
 
-### 5. SignalR Hub
+### 5. Prometheus Metrics
+
+**Endpoint:** `GET /metrics`
+
+**Response:** Prometheus text exposition format. Scraped every 5s by the `prometheus` container.
+
+Key metrics:
+
+| Metric | Type | Labels |
+|--------|------|--------|
+| `aerostream_telemetry_received_total` | Counter | `drone_id` |
+| `aerostream_ingestion_channel_depth` | Gauge | — |
+| `aerostream_persistence_batch_duration_seconds` | Histogram | `outcome` (success/failure) |
+| `aerostream_geofence_breach_total` | Counter | — |
+| `aerostream_rtl_triggered_total` | Counter | `reason` (geofence/battery_critical/operator_manual) |
+| `aerostream_rabbitmq_published_total` | Counter | `routing_key` |
+| `aerostream_rabbitmq_consumed_total` | Counter | `queue`, `result` (ack/nack_requeue/nack_dead_letter) |
+| `http_request_duration_seconds` | Histogram | `code`, `method`, `endpoint` (via prometheus-net) |
+
+---
+
+### 6. SignalR Hub
 
 **Hub URL:** `ws://localhost:5233/telemetryHub`
+
 
 **Method:** `ReceiveTelemetry` (server → client)
 
@@ -393,19 +436,39 @@ while (!isDbReady && !stoppingToken.IsCancellationRequested)
 
 ## Command & Control
 
-### Mechanism: Piggybacking
+### Mechanism: Durable Queue + Piggybacking
 
-Commands are attached to telemetry responses, eliminating separate command channels.
+Commands flow through a durable RabbitMQ queue before being written to the in-memory delivery dict. This means the command survives an API restart before consumption. The piggyback delivery step (dict → 202 body) is still in-memory only.
 
 ```
 1. Pilot clicks "Return to Launch"
 2. Dashboard POSTs /command/{deviceId}
-3. API stores in ConcurrentDictionary
-4. [Next 100ms] Drone sends telemetry
-5. API checks dict, finds command
-6. Returns command in 202 response
-7. Drone parses and executes
+3. API publishes to RabbitMQ topic exchange (routing key: command.rtl)
+   └─ Exchange → command-dispatch-queue (durable, persistent messages)
+4. CommandDispatchConsumer reads and acks the message
+5. Consumer writes command to ConcurrentDictionary<droneId, C2Payload>
+6. [Next 100ms] Drone sends telemetry
+7. API checks dict, removes command, returns in 202 response body
+8. Drone parses and executes
+
+Residual window (still in-memory): steps 5–7.
+A crash after step 4 loses the command. Full fix: persist to Postgres at step 5,
+remove on step 7.
 ```
+
+### Alert Path
+
+Battery-critical and geofence-breach events are also published to RabbitMQ:
+
+```
+POST /telemetry triggers condition
+  → publish telemetry.alert.battery or telemetry.alert.geofence
+  → telemetry-alert-queue (durable)
+  → CommandDispatchConsumer alert branch reads and acks
+  → log / forward to downstream consumers
+```
+
+Poison-message handling: `JsonException` → `nack(requeue: false)` → dead-letter exchange (DLX). Other exceptions → `nack(requeue: true)` for transient retry. Split catch blocks prevent infinite requeue on malformed payloads.
 
 ---
 
@@ -414,16 +477,25 @@ Commands are attached to telemetry responses, eliminating separate command chann
 ```
 AeroStream/
 ├── Dockerfile (multi-stage build)
-├── docker-compose.yml (3 services)
+├── docker-compose.yml (6 services: db, rabbitmq, ingestion-api, dashboard, prometheus, grafana)
+├── prometheus.yml (scrape config — job: aerostream-api, interval: 5s)
+├── grafana/
+│   └── provisioning/
+│       ├── datasources/prometheus.yml (uid: prometheus, url: http://prometheus:9090)
+│       └── dashboards/
+│           ├── dashboard.yml (file provider)
+│           └── aerostream.json (7-panel dashboard)
 ├── README.md
 ├── simulate.js (Node.js simulator)
 ├── src/
 │   ├── AeroStream.Ingestion/
-│   │   ├── Program.cs (API, DI)
+│   │   ├── Program.cs (API endpoints, DI, IngestMetrics)
 │   │   ├── TelemetryDbContext.cs
 │   │   ├── TelemetryRecord.cs
-│   │   ├── TelemetryProcessor.cs ← BATCH PERSISTENCE
+│   │   ├── TelemetryProcessor.cs (batch persistence, ChannelDepth gauge, BatchDuration histogram)
 │   │   ├── TelemetryHub.cs
+│   │   ├── RabbitMqPublisher.cs (single-flight reconnect, s_published counter)
+│   │   ├── CommandDispatchConsumer.cs (command + alert consumers, s_consumed counter)
 │   │   └── AeroStream.Ingestion.csproj
 │   └── AeroStream.Dashboard/
 │       ├── src/App.tsx
@@ -433,6 +505,7 @@ AeroStream/
 │   └── src/ (ESP32 C++ code)
 └── tests/
     └── AeroStream.Tests/
+        └── RabbitMqTests.cs (10 tests: ProcessMessage × 5, publisher × 2, health × 3)
 ```
 
 ---
@@ -458,7 +531,11 @@ node simulate.js
 
 - Dashboard: http://localhost:5173
 - API Health: http://localhost:5233/health
+- API Metrics: http://localhost:5233/metrics
 - Database: localhost:5432 (admin / value from `AEROSTREAM_DB_PASSWORD` or local compose default)
+- RabbitMQ management UI: http://localhost:15672 (guest / guest — localhost only)
+- Prometheus: http://localhost:9090
+- Grafana: http://localhost:3000 (admin / admin — **rotate before any non-local exposure**)
 
 ---
 
@@ -466,14 +543,18 @@ node simulate.js
 
 ### Pre-Production Checklist
 
-- [ ] Change Postgres password
+- [ ] Change Postgres password (`AEROSTREAM_DB_PASSWORD`)
+- [ ] Rotate RabbitMQ credentials (remove `guest` user; create dedicated user with limited vhost permissions)
+- [ ] Rotate Grafana admin password (`GF_SECURITY_ADMIN_PASSWORD`)
 - [ ] Use HTTPS (SSL termination)
 - [ ] Add authentication to SignalR
-- [ ] Add rate limiting to /telemetry
+- [ ] Rate limiting on `/telemetry` (✅ DONE — per-drone fixed window)
 - [ ] Implement batch persistence (✅ DONE)
-- [ ] Add database indexes
+- [ ] Add database indexes on `(DeviceId, Timestamp DESC)`
+- [ ] Implement telemetry retention policy (append-only until manually purged)
+- [ ] Persist consumed-but-undelivered commands to PostgreSQL (close residual ack window)
 - [ ] Enable backups
-- [ ] Configure monitoring/alerts
+- [ ] Configure Prometheus alerting rules
 
 ---
 

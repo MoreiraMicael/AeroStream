@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json;
+using Prometheus;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 
@@ -13,6 +14,10 @@ public class CommandDispatchConsumer(
 {
     private static readonly JsonSerializerOptions s_jsonOptions = new() { PropertyNameCaseInsensitive = true };
 
+    private static readonly Counter s_consumed = Metrics.CreateCounter(
+        "aerostream_rabbitmq_consumed_total",
+        "Messages consumed from RabbitMQ queues.",
+        new CounterConfiguration { LabelNames = ["queue", "result"] });
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         while (!stoppingToken.IsCancellationRequested)
@@ -27,14 +32,27 @@ public class CommandDispatchConsumer(
 
                 await channel.ExchangeDeclareAsync("aerostream.events", ExchangeType.Topic, durable: true, cancellationToken: stoppingToken);
 
+                // Dead-letter exchange: nacked messages with requeue:false route here instead of vanishing.
+                await channel.ExchangeDeclareAsync("aerostream.dlx", ExchangeType.Fanout, durable: true, cancellationToken: stoppingToken);
+                await channel.QueueDeclareAsync("dead-letter-queue", durable: true, exclusive: false, autoDelete: false, cancellationToken: stoppingToken);
+                await channel.QueueBindAsync("dead-letter-queue", "aerostream.dlx", routingKey: "", cancellationToken: stoppingToken);
+
+                // x-dead-letter-exchange routes permanently-failed messages to aerostream.dlx
+                // instead of dropping them silently.
+                var dlxArgs = new Dictionary<string, object?> { ["x-dead-letter-exchange"] = "aerostream.dlx" };
+
+                await channel.QueueDeclareAsync("command-dispatch-queue", durable: true, exclusive: false, autoDelete: false, arguments: dlxArgs, cancellationToken: stoppingToken);
+                await channel.QueueBindAsync("command-dispatch-queue", "aerostream.events", "command.#", cancellationToken: stoppingToken);
+                await channel.QueueDeclareAsync("telemetry-alert-queue", durable: true, exclusive: false, autoDelete: false, arguments: dlxArgs, cancellationToken: stoppingToken);
                 await channel.QueueDeclareAsync("command-dispatch-queue", durable: true, exclusive: false, autoDelete: false, cancellationToken: stoppingToken);
                 await channel.QueueBindAsync("command-dispatch-queue", "aerostream.events", "command.#", cancellationToken: stoppingToken);
-
                 await channel.QueueDeclareAsync("telemetry-alert-queue", durable: true, exclusive: false, autoDelete: false, cancellationToken: stoppingToken);
                 await channel.QueueBindAsync("telemetry-alert-queue", "aerostream.events", "telemetry.alert.#", cancellationToken: stoppingToken);
-
                 await channel.BasicQosAsync(prefetchSize: 0, prefetchCount: 10, global: false, cancellationToken: stoppingToken);
 
+                // Command consumer.
+                // Ack guarantee: survives API restart before consumption; a crash after ack but before
+                // drone telemetry delivery still loses the command (full fix = persist commandQueue to DB).
                 // Command consumer — writes to in-memory commandQueue for drone ACK piggybacking.
                 // Ack guarantee: survives API restart before consumption; a crash after ack but before
                 // drone telemetry still loses the command (full fix = persist commandQueue to DB).
@@ -46,6 +64,22 @@ public class CommandDispatchConsumer(
                         var json = Encoding.UTF8.GetString(ea.Body.Span);
                         ProcessMessage(json, commandQueue);
                         await channel.BasicAckAsync(ea.DeliveryTag, multiple: false);
+                        s_consumed.WithLabels("command-dispatch-queue", "ack").Inc();
+                    }
+                    catch (JsonException ex)
+                    {
+                        // Permanent failure — malformed JSON will never parse correctly.
+                        // nack + requeue:false → DLX captures it; no infinite retry loop.
+                        logger.LogError("[MQ] Malformed command message (→ DLQ): {Msg}", ex.Message);
+                        await channel.BasicNackAsync(ea.DeliveryTag, multiple: false, requeue: false);
+                        s_consumed.WithLabels("command-dispatch-queue", "nack_dead_letter").Inc();
+                    }
+                    catch (Exception ex)
+                    {
+                        // Transient failure (DB down, timeout, etc.) — safe to retry.
+                        logger.LogError("[MQ] Transient command processing error (requeue): {Msg}", ex.Message);
+                        await channel.BasicNackAsync(ea.DeliveryTag, multiple: false, requeue: true);
+                        s_consumed.WithLabels("command-dispatch-queue", "nack_requeue").Inc();
                     }
                     catch (Exception ex)
                     {
@@ -67,6 +101,19 @@ public class CommandDispatchConsumer(
                             logger.LogWarning("[ALERT] {AlertType} — Drone {DroneId} — Value: {Value:F1} at {Timestamp:O}",
                                 alert.AlertType, alert.DroneId, alert.Value, alert.Timestamp);
                         await channel.BasicAckAsync(ea.DeliveryTag, multiple: false);
+                        s_consumed.WithLabels("telemetry-alert-queue", "ack").Inc();
+                    }
+                    catch (JsonException ex)
+                    {
+                        logger.LogError("[ALERT] Malformed alert message (→ DLQ): {Msg}", ex.Message);
+                        await channel.BasicNackAsync(ea.DeliveryTag, multiple: false, requeue: false);
+                        s_consumed.WithLabels("telemetry-alert-queue", "nack_dead_letter").Inc();
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError("[ALERT] Transient consumer error (requeue): {Msg}", ex.Message);
+                        await channel.BasicNackAsync(ea.DeliveryTag, multiple: false, requeue: true);
+                        s_consumed.WithLabels("telemetry-alert-queue", "nack_requeue").Inc();
                     }
                     catch (Exception ex)
                     {

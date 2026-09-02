@@ -1,15 +1,30 @@
+using System.Diagnostics;
 using System.Threading.Channels;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
+using Prometheus;
 
 namespace AeroStream.Ingestion;
 
 public class TelemetryProcessor(
-    Channel<TelemetryRecord> channel, 
+    Channel<TelemetryRecord> channel,
     IHubContext<TelemetryHub> hubContext,
     IDbContextFactory<TelemetryDbContext> dbFactory,
     ILogger<TelemetryProcessor> logger) : BackgroundService
 {
+    // Gauge is internal so Program.cs can increment it on enqueue without a separate registry lookup.
+    internal static readonly Gauge ChannelDepth = Metrics.CreateGauge(
+        "aerostream_ingestion_channel_depth",
+        "Current number of telemetry records waiting in the ingestion channel.");
+
+    private static readonly Histogram BatchDuration = Metrics.CreateHistogram(
+        "aerostream_persistence_batch_duration_seconds",
+        "Duration of a batch persist to PostgreSQL, labelled by outcome.",
+        new HistogramConfiguration
+        {
+            LabelNames = ["outcome"],
+            Buckets = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
+        });
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         // --- RESILIENT STARTUP LOOP ---
@@ -40,8 +55,9 @@ public class TelemetryProcessor(
         
         await foreach (var record in channel.Reader.ReadAllAsync(stoppingToken))
         {
-            try 
-            {  
+            ChannelDepth.Dec();
+            try
+            {
                 // 1. BROADCAST FIRST (Real-time speed for the pilot)
                 // SignalR will automatically camelCase these properties (e.g., Latitude -> latitude)
                 await hubContext.Clients.All.SendAsync("ReceiveTelemetry", record, stoppingToken);
@@ -88,15 +104,18 @@ public class TelemetryProcessor(
         if (records.Count == 0)
             return;
 
+        var sw = Stopwatch.StartNew();
         try
         {
             using var db = await dbFactory.CreateDbContextAsync(stoppingToken);
             db.Telemetry.AddRange(records);
             await db.SaveChangesAsync(stoppingToken);
             logger.LogInformation("Persisted batch of {Count} records to database", records.Count);
+            BatchDuration.WithLabels("success").Observe(sw.Elapsed.TotalSeconds);
         }
         catch (Exception ex)
         {
+            BatchDuration.WithLabels("failure").Observe(sw.Elapsed.TotalSeconds);
             logger.LogError("Batch persistence failed: {Msg}. Records in batch: {Count}", ex.Message, records.Count);
             throw;
         }

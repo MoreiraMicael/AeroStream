@@ -50,5 +50,28 @@ services:
     depends_on:
       - ingestion-api
 
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: aerostream-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+    depends_on:
+      - ingestion-api
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: aerostream-grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+    depends_on:
+      - prometheus
+
 volumes:
   pgdata:
