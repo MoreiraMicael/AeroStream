@@ -1,6 +1,7 @@
 using AeroStream.Ingestion;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using System.Collections.Concurrent;
 
@@ -93,12 +94,16 @@ public class RabbitMqPublisherTests
     }
 
     [Fact]
-    public async Task PublishAsync_AfterFailedReconnect_SucceedsWhenBrokerAvailable()
+    public async Task PublishAsync_AfterFailedReconnect_AttemptsNewReconnect()
     {
-        // Simulates a broker restart. Without the finally-block null-clear in DoReconnectAsync,
-        // _reconnectTask would remain a completed Task<bool>(false) after the first failure.
-        // The second call would hit ??= with a non-null task, skip creating a new one, and
-        // throw immediately — never attempting TCP even though the broker is now reachable.
+        // Verifies the finally block in DoReconnectAsync clears _reconnectTask so that a
+        // subsequent PublishAsync creates a FRESH DoReconnectAsync task instead of reusing
+        // the completed-but-failed one.
+        //
+        // Observable: DoReconnectAsync logs "reconnect failed" on every attempt. Without the
+        // finally-block null-clear, Phase 2 reuses the completed Task<bool>(false) directly
+        // and DoReconnectAsync never runs again → logger count stays at 1. With the clear,
+        // Phase 2 spawns a new DoReconnectAsync → count reaches 2.
         var config = new ConfigurationBuilder()
             .AddInMemoryCollection(new Dictionary<string, string?>
             {
@@ -107,22 +112,33 @@ public class RabbitMqPublisherTests
             })
             .Build();
 
-        await using var publisher = new RabbitMqPublisher(config, NullLogger<RabbitMqPublisher>.Instance);
+        var logger = new ReconnectCountingLogger();
+        await using var publisher = new RabbitMqPublisher(config, logger);
 
-        // Phase 1: broker unreachable — must throw.
+        // Phase 1: fails, DoReconnectAsync logs once, finally clears _reconnectTask.
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            publisher.PublishAsync("test.refused", new { x = 1 }));
-        Assert.False(publisher.IsConnected);
+            publisher.PublishAsync("test.1", new { }));
+        Assert.Equal(1, logger.ReconnectAttempts);
 
-        // "Broker restarts": update config to point at live RabbitMQ.
-        // IConfiguration.set propagates through ConfigurationRoot → MemoryConfigurationProvider.Data,
-        // so the next BuildFactory() call inside DoReconnectAsync reads the new values.
-        config["RabbitMq:Host"] = "localhost";
-        config["RabbitMq:Port"] = "5672";
+        // Phase 2: must trigger a second DoReconnectAsync (not reuse the cached false task).
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            publisher.PublishAsync("test.2", new { }));
+        Assert.Equal(2, logger.ReconnectAttempts);
+    }
 
-        // Phase 2: broker reachable — must not throw.
-        await publisher.PublishAsync("test.live", new { x = 2 });
-        Assert.True(publisher.IsConnected);
+    private sealed class ReconnectCountingLogger : ILogger<RabbitMqPublisher>
+    {
+        private int _attempts;
+        public int ReconnectAttempts => _attempts;
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            if (formatter(state, exception).Contains("reconnect failed"))
+                Interlocked.Increment(ref _attempts);
+        }
     }
 }
 
